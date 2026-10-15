@@ -458,3 +458,26 @@ test('config: 台帳フォルダを変えられる', { options: { ledgerDir: '.p
   expect(asked[0]).toBe('/w/.progress/completion-sid.json')
   expect((await band($)).text).toMatch(/依頼 完了/)
 })
+
+// ---- 台帳の場所を Claude に伝える ----
+const COMPOSE = { model: 'm', promptModel: 'm', surfaces: [], tools: [], outputStyle: null, traits: [] }
+
+test('hint: システムプロンプトにこのセッションの台帳の場所と形式を加える', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'x', scope: 'shared' }] }))
+  const r = await $.prompt.compose(COMPOSE as any)
+  const ours = r.sections.find((s: any) => s.id === 'done-board:ledger')
+  expect(ours?.text).toMatch(/\/w\/work\/autonomy\/completion-sid\.json/)
+  expect(ours?.text).toMatch(/"status":"pending\|running\|done\|blocked"/)
+  expect(ours?.scope).toBe('session')
+  expect(r.sections[0].id).toBe('intro')
+})
+
+test('hint: promptHint を切ると加えない', { options: { promptHint: false } }, async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'x', scope: 'shared' }] }))
+  const r = await $.prompt.compose(COMPOSE as any)
+  expect(r.sections.map((s: any) => s.id)).toEqual(['intro'])
+})

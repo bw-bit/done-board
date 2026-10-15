@@ -44,8 +44,8 @@ type Decision = { card: Card; isAudible: boolean }
 const POLL_MS = 4000
 
 // userConfig の値（register で受け取る）。既定値は plugin.json と同じ
-type Config = { ledgerDir: string; music: boolean; musicVolume: number; effects: boolean; debugLog: boolean }
-let config: Config = { ledgerDir: 'work/autonomy', music: true, musicVolume: 0.35, effects: true, debugLog: false }
+type Config = { ledgerDir: string; music: boolean; musicVolume: number; effects: boolean; debugLog: boolean; promptHint: boolean }
+let config: Config = { ledgerDir: 'work/autonomy', music: true, musicVolume: 0.35, effects: true, debugLog: false, promptHint: true }
 
 function readConfig(options: Readonly<Record<string, unknown>>): Config {
   const volume = Number(options.musicVolume)
@@ -55,6 +55,7 @@ function readConfig(options: Readonly<Record<string, unknown>>): Config {
     musicVolume: Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : config.musicVolume,
     effects: options.effects !== false,
     debugLog: options.debugLog === true,
+    promptHint: options.promptHint !== false,
   }
 }
 
@@ -90,6 +91,25 @@ function clip(text: string, max: number): string {
 function progressBar(done: number, total: number): string {
   const filled = Math.round((done / total) * BAR_CELLS)
   return `${'█'.repeat(filled)}${'░'.repeat(BAR_CELLS - filled)} ${Math.round((done / total) * 100)}%`
+}
+
+// このセッションの台帳を書く場所（Claude に伝える絶対パス）
+async function ledgerPathFor($: any): Promise<string> {
+  const id = await $.session.id()
+  const dir = config.ledgerDir.startsWith('/') ? config.ledgerDir : `${await $.session.cwd()}/${config.ledgerDir}`
+  return `${dir}/completion-${id}.json`
+}
+
+// Claude は自分のセッション ID を知らないので、台帳の場所と書き方をシステムプロンプトで伝える
+function ledgerHint(path: string): string {
+  return [
+    'done-board プラグイン: 手順が2つ以上ある作業では、進み具合をこのファイルに JSON で書いてください。',
+    `台帳: ${path}`,
+    '形式: {"status":"running","request_summary":"依頼の要約","items":[{"id":"短い英数字","status":"pending|running|done|blocked","note":"何をするか"}]}',
+    '作業を始める前に項目を並べて作り、各項目を始めたら running、終えたらすぐ done に書き換えてください。全部終えたら status を done にします。',
+    '人の操作を待つ項目は blocked にして note に理由を書きます。看板・作業BGM・効果音がこの台帳を読んで動きます。',
+    '1回で答えられる質問や1か所だけの小さな修正では書かなくてかまいません。',
+  ].join('\n')
 }
 
 // 完了台帳は work/autonomy/completion-<session_id>.json。置き場の違いに備えて複数候補を探す
@@ -293,6 +313,17 @@ export const register: Register = (on, options) => {
     }
     const playing = await read($, nowPlaying)
     return { text: `作業BGM: ${(await read($, isMusicOn)) ? 'オン' : 'オフ'} ・ ${playing ?? '停止中'} ・ 連続 ${await read($, streak)}` }
+  })
+
+  on('prompt.compose', async ($, e, next) => {
+    const result = await next(e)
+    if (!config.promptHint) return result
+    try {
+      const text = ledgerHint(await ledgerPathFor($))
+      return { sections: [...result.sections, { id: 'done-board:ledger', text, scope: 'session' as const }] }
+    } catch {
+      return result
+    }
   })
 
   on('turn.start', async ($, e, next) => {

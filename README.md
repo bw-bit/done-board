@@ -40,7 +40,7 @@ BGM のテンポは4段階です。
 
 ## 完了台帳
 
-看板とテンポは、作業フォルダの `work/autonomy/completion-<session_id>.json` を読んで決まります。Claude にこの形式で台帳を書かせると動きます。
+看板とテンポは、作業フォルダの `work/autonomy/completion-<session_id>.json` を読んで決まります。プラグインがセッションごとにこの場所と書き方を Claude に伝えるので、手順のある作業を頼めば Claude が自分で台帳を書きます。形式は次のとおりです。
 
 ```json
 {
@@ -73,6 +73,7 @@ BGM のテンポは4段階です。
 | `musicVolume` | 0.35 | BGM の音量（0〜1） |
 | `effects` | オン | コンボ音・レベルアップ音・ファンファーレ |
 | `debugLog` | オフ | 作業フォルダの `.claude/done-board-debug.log` に動作を記録 |
+| `promptHint` | オン | 台帳の場所と書き方をシステムプロンプトで Claude に伝える |
 
 ## 動く環境
 
