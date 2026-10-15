@@ -1,0 +1,48 @@
+{
+  "name": "done-board",
+  "version": "1.0.0",
+  "description": "作業の進み具合を看板・作業BGM・ご褒美の音で見せる。完了台帳を読み、項目を終えるたびにコンボ音、残りが減るほどBGMが速くなる",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "bw-bit"
+  },
+  "license": "MIT",
+  "keywords": [
+    "productivity",
+    "bgm",
+    "progress",
+    "gamification"
+  ],
+  "userConfig": {
+    "ledgerDir": {
+      "type": "string",
+      "title": "完了台帳のフォルダ",
+      "description": "completion-<session_id>.json を置くフォルダ。相対パスは作業フォルダ基準",
+      "default": "work/autonomy"
+    },
+    "music": {
+      "type": "boolean",
+      "title": "作業BGM",
+      "description": "作業中にBGMを流す",
+      "default": true
+    },
+    "musicVolume": {
+      "type": "number",
+      "title": "BGMの音量",
+      "description": "0〜1",
+      "default": 0.35
+    },
+    "effects": {
+      "type": "boolean",
+      "title": "効果音",
+      "description": "コンボ音・レベルアップ音・ファンファーレ",
+      "default": true
+    },
+    "debugLog": {
+      "type": "boolean",
+      "title": "診断ログ",
+      "description": "作業フォルダの .claude/done-board-debug.log に動作を記録する",
+      "default": false
+    }
+  }
+}

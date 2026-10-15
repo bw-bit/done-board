@@ -1,0 +1,13 @@
+{
+  "name": "done-board",
+  "description": "作業の進み具合を看板・作業BGM・ご褒美の音で見せる Claude Code プラグイン",
+  "owner": {
+    "name": "bw-bit"
+  },
+  "plugins": [
+    {
+      "name": "done-board",
+      "source": "./"
+    }
+  ]
+}
