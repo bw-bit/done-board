@@ -7,8 +7,6 @@ import { stripSvg } from './cat-svg'
 type Item = { id: string; status: string; note?: string }
 type Ledger = { status: string; request_summary?: string; items: Item[] } | null
 
-// テスト用の小さな PNG（1x1、透明）。コマ絵の読み込みの代わり
-const TINY_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
 let agents: { status: string }[] = []
 let toasts: string[] = []
 
@@ -24,7 +22,7 @@ function stub(on: On, ledgerOf: Ledger | (() => Ledger | string), sounds: string
     return { value: get() !== null && e.path === ledgerPath }
   })
   on('fs.read', ($, e: any) => {
-    if (e.as === 'bytes') return { value: { base64: TINY_PNG } }
+    if (String(e.path).endsWith('.paths')) return { value: '10 10\n<path fill="#f5a623" d="M0 0h10v10h-10z"/>' }
     const l = get()
     return { value: typeof l === 'string' ? l : JSON.stringify(l) }
   })
@@ -664,12 +662,15 @@ test('nyanko: デスクトップでは何もなくても帯が常に出て、猫
   expect(svg).toBeDefined()
   expect(source).toMatch(/Lv\.1/)
   expect(source).toMatch(/ひと休み中/)
-  expect(source).toMatch(/<image href="data:image\/png;base64,/)
+  // 埋め込み画像ではなく図形で描く（デスクトップは <image> を描かない）
+  expect(source).toMatch(/<path fill="#f5a623"/)
+  expect(source).not.toMatch(/<image/)
   expect(source).toMatch(/data-pose="sleep"/)
 })
 
 test('nyanko: 帯の SVG は上限（131072 文字）に収まる', () => {
-  const big = { uri: `data:image/png;base64,${'A'.repeat(8000)}`, width: 100, height: 96 }
+  // 実際のコマ絵で一番大きいもの（約 2.8 万文字）を想定し、余裕を見て 3.2 万文字
+  const big = { paths: `<path d="${'M0 0h1v1h-1z'.repeat(2600)}"/>`, width: 73, height: 56 }
   const s = stripSvg({ width: 760, accent: 'progress', pose: 'run', cat: big, title: 't', detail: 'd', ratio: 0.5, steps: Array(24).fill('done'), level: 9, xpCurrent: 10, xpNeed: 100, playing: 'x', tierRank: 4, streak: 5, isMuted: false, id: 1 })
   expect(s.length).toBeLessThan(131072)
 })

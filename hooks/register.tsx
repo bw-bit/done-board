@@ -319,18 +319,19 @@ async function refreshAgents($: any): Promise<void> {
   }
 }
 
-// コマ絵を読み込む。PNG の幅と高さはヘッダから読む
+// コマ絵を読み込む。1 行目が「幅 高さ」、2 行目以降が SVG のパス
 async function spriteOf($: any, name: string): Promise<Sprite | null> {
   if (spriteCache.has(name)) return spriteCache.get(name) ?? null
   let sprite: Sprite | null = null
   try {
-    const got = await $.fs.read(`${$.plugin.root}/sprites/${name}.png`, { as: 'bytes' })
-    const base64 = typeof got === 'object' && got !== null ? String((got as { base64?: string }).base64 ?? '') : ''
-    const head = atob(base64.slice(0, 44))
-    const dim = (o: number) => ((head.charCodeAt(o) << 24) | (head.charCodeAt(o + 1) << 16) | (head.charCodeAt(o + 2) << 8) | head.charCodeAt(o + 3)) >>> 0
-    if (head.slice(1, 4) === 'PNG') sprite = { uri: `data:image/png;base64,${base64}`, width: dim(16), height: dim(20) }
-  } catch {
-    sprite = null
+    const text = String(await $.fs.read(`${$.plugin.root}/sprites/${name}.paths`))
+    const nl = text.indexOf('\n')
+    const [w, h] = text.slice(0, nl).split(' ').map(Number)
+    if (nl > 0 && Number.isFinite(w) && Number.isFinite(h) && (w ?? 0) > 0 && (h ?? 0) > 0) {
+      sprite = { paths: text.slice(nl + 1), width: w as number, height: h as number }
+    }
+  } catch (err) {
+    await beat($, 'sprite.error', { name, error: String(err).slice(0, 200) })
   }
   spriteCache.set(name, sprite)
   return sprite

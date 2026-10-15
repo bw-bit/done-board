@@ -1,5 +1,6 @@
 // 常時表示のニャンコ帯を SVG で組み立てる（$ を使わない純粋な関数）
-// 猫の絵は画像生成したコマ絵（sprites/*.png）を data URI で埋め込み、動きは SMIL で付ける
+// 猫の絵は画像生成したコマ絵を、色ごとのパスに自動変換したもの（sprites/*.paths）。
+// デスクトップの SVG は埋め込み画像（<image>）を描かないため、図形として埋め込む。動きは SMIL で付ける
 import type { Kind } from '../types'
 import { escapeXml, fitText } from './svg-text'
 
@@ -32,7 +33,8 @@ const BOB: Record<Pose, { dur: number; dy: number }> = {
   hurt: { dur: 0.25, dy: 1.5 },
 }
 
-export type Sprite = { uri: string; width: number; height: number }
+// paths は (0,0)〜(width,height) の座標で描かれた SVG のパス群
+export type Sprite = { paths: string; width: number; height: number }
 
 export type StripView = {
   width: number
@@ -89,9 +91,12 @@ function spriteAt(sprite: Sprite | null, x: number, ground: number, height: numb
   const w = (sprite.width / sprite.height) * height
   const y = ground - height
   const bob = BOB[pose]
-  const flip = isFlipped ? ` transform="translate(${(2 * x + w).toFixed(1)},0) scale(-1,1)"` : ''
+  const k = height / sprite.height
+  const place = isFlipped
+    ? `translate(${(x + w).toFixed(1)},${y.toFixed(1)}) scale(${(-k).toFixed(4)},${k.toFixed(4)})`
+    : `translate(${x.toFixed(1)},${y.toFixed(1)}) scale(${k.toFixed(4)})`
   return `<g data-pose="${pose}"><animateTransform attributeName="transform" type="translate" values="0 0;0 ${-bob.dy};0 0" dur="${bob.dur}s" repeatCount="indefinite"/>
-<g${flip}><image href="${sprite.uri}" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${height}"/></g></g>`
+<g transform="${place}" shape-rendering="crispEdges">${sprite.paths}</g></g>`
 }
 
 // 右側: レベル・経験値ゲージ・BGM・連続・音の状態

@@ -1,6 +1,6 @@
 {
   "name": "done-board",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "作業の進み具合を、常時表示のニャンコ・作業BGM・ご褒美の音で見せる。消費トークンで経験値がたまり、たまに野良猫とバトル。サブエージェント中は早送りの曲",
   "types": "./types/index.d.ts",
   "author": {
