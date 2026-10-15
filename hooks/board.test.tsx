@@ -1,12 +1,20 @@
 import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { cardSvg } from './card-svg'
+import { levelOf, pickEnemy, simulateBattle, xpFromUsage, xpToReach } from './game'
+import { stripSvg } from './cat-svg'
 
 // 依頼台帳を差し替えて、ターン終了時に看板がどう描かれるかを確かめる
 type Item = { id: string; status: string; note?: string }
 type Ledger = { status: string; request_summary?: string; items: Item[] } | null
 
-function stub(on: On, ledgerOf: Ledger | (() => Ledger | string), sounds: string[] = [], ledgerPath = '/w/work/autonomy/completion-sid.json', asked: string[] = []) {
+// テスト用の小さな PNG（1x1、透明）。コマ絵の読み込みの代わり
+const TINY_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+let agents: { status: string }[] = []
+let toasts: string[] = []
+
+function stub(on: On, ledgerOf: Ledger | (() => Ledger | string), sounds: string[] = [], ledgerPath = '/w/work/autonomy/completion-sid.json', asked: string[] = [], store: Record<string, unknown> = {}) {
+  agents = []
+  toasts = []
   const get = () => (typeof ledgerOf === 'function' ? ledgerOf() : ledgerOf)
   on('session.id', () => ({ value: 'sid' }))
   on('session.cwd', () => ({ value: '/w' }))
@@ -15,7 +23,8 @@ function stub(on: On, ledgerOf: Ledger | (() => Ledger | string), sounds: string
     asked.push(e.path)
     return { value: get() !== null && e.path === ledgerPath }
   })
-  on('fs.read', () => {
+  on('fs.read', ($, e: any) => {
+    if (e.as === 'bytes') return { value: { base64: TINY_PNG } }
     const l = get()
     return { value: typeof l === 'string' ? l : JSON.stringify(l) }
   })
@@ -23,7 +32,16 @@ function stub(on: On, ledgerOf: Ledger | (() => Ledger | string), sounds: string
     sounds.push((e.clip.asset ?? '?') + (e.shouldLoop ? ' (loop)' : ''))
     return { value: undefined }
   })
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', ($, e: any) => {
+    toasts.push(String(e.text))
+    return { value: undefined }
+  })
+  on('agent.list', () => ({ value: agents }) as any)
+  on('store.get', ($, e: any) => ({ value: store[e.key] }))
+  on('store.set', ($, e: any) => {
+    store[e.key] = e.value
+    return { value: undefined }
+  })
   on('ui.status', () => ({ value: undefined }))
   on('turn.complete', () => ({ text: '' }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
@@ -73,8 +91,9 @@ test('done: 全項目完了で完了看板と完了音、時間が経つと消�
   expect(sounds).toContain('sounds/fanfare.wav')
   await clock.advance(60000)
   const after = await band($)
-  console.log(`RENDER done+60s | ${after.text || '(消えた)'}`)
-  expect(after.text).toBe('')
+  console.log(`RENDER done+60s | ${after.text}`)
+  expect(after.text).not.toMatch(/依頼 完了/)
+  expect(after.text).toMatch(/ひと休み中/)
 })
 
 test('progress: 残りがあれば件数と次の1手', async ($, on) => {
@@ -105,7 +124,8 @@ test('閉じるボタンで消える', async ($, on) => {
   expect(btn).toBeDefined()
   await ui.press({ key: btn!.key! })
   const after = await band($)
-  expect(after.text).toBe('')
+  expect(after.text).not.toMatch(/依頼 完了/)
+  expect(after.text).toMatch(/ひと休み中/)
 })
 
 // ---- ループ1回目で追加: 正確さ ----
@@ -229,7 +249,7 @@ test('r3: 消える直前は薄くなってから消える', async ($, on) => {
   console.log(`RENDER fade     | ${fading.text}  (title dimColor=${(title as any)?.props?.dimColor})`)
   expect((title as any)?.props?.dimColor).toBe(true)
   await clock.advance(3000)
-  expect((await band($)).text).toBe('')
+  expect((await band($)).text).not.toMatch(/依頼 完了/)
 })
 
 test('r3: 短いやり取りでは音を鳴らさず、長いターンだけ鳴らす', async ($, on) => {
@@ -381,22 +401,16 @@ test('u1: 前から終わっていた項目は連続に数えない', async ($, 
   expect(text).not.toMatch(/連続/)
 })
 
-test('u1: カードごとにグラデーションの id が違う（並べても色が混ざらない）', async () => {
-  const mk = (kind: any, id: number) => cardSvg({ card: { kind, title: 't', detail: 'd', done: 1, total: 2, id, phase: 'shown', frame: 0 }, icon: '◐', playing: null, width: 400 })
-  const a = mk('done', 1).match(/linearGradient id="([^"]+)"/)![1]
-  const b = mk('blocked', 2).match(/linearGradient id="([^"]+)"/)![1]
+test('u1: 帯ごとにグラデーションの id が違う（並べても色が混ざらない）', () => {
+  const a = VIEW({ accent: 'done', id: 1 }).match(/linearGradient id="([^"]+)"/)![1]
+  const b = VIEW({ accent: 'blocked', id: 2 }).match(/linearGradient id="([^"]+)"/)![1]
   expect(a).not.toBe(b)
 })
 
-// ---- UIループ2回目: 動き・全体像・テンポ・連続 ----
-const VIEW = ({ card: cardOver = {}, ...over }: any = {}) => cardSvg({
-  icon: '✧', playing: 'ドライブ ×1.1', width: 640, tierRank: 2, streak: 3, ...over,
-  card: { kind: 'progress', title: '+1 完了', detail: 'build', done: 2, total: 4, id: 1, phase: 'pop', frame: 0, steps: ['done', 'done', 'running', 'pending'], fromRatio: 0.25, ...cardOver },
-})
-
-test('u2: リングは前回の割合から今回の割合へ伸びるアニメーション', () => {
-  const s = VIEW()
-  expect(s).toMatch(/<animate attributeName="stroke-dashoffset"/)
+// ---- UIループ2回目の要素（いまはニャンコ帯の中） ----
+const VIEW = (over: any = {}) => stripSvg({
+  width: 640, accent: 'progress', pose: 'run', cat: null, title: '✧ +1 完了  50%', detail: 'build', ratio: 0.5,
+  steps: ['done', 'done', 'running', 'pending'], level: 2, xpCurrent: 10, xpNeed: 100, playing: 'ドライブ ×1.1', tierRank: 2, streak: 3, isMuted: false, id: 1, ...over,
 })
 
 test('u2: 項目ごとの状態を点で並べる', () => {
@@ -405,10 +419,10 @@ test('u2: 項目ごとの状態を点で並べる', () => {
   expect(s).toMatch(/data-step="running"/)
 })
 
-test('u2: テンポメーターは4段で、今の段まで点灯する', () => {
+test('u2: テンポメーターは5段（早送りを含む）で、今の段まで点灯する', () => {
   const s = VIEW()
   expect((s.match(/data-tempo="on"/g) ?? []).length).toBe(3)
-  expect((s.match(/data-tempo="off"/g) ?? []).length).toBe(1)
+  expect((s.match(/data-tempo="off"/g) ?? []).length).toBe(2)
 })
 
 test('u2: 2連続以上は🔥バッジで目立たせる', () => {
@@ -425,7 +439,7 @@ test('u2: デスクトップの Svg は動きを出すため interactive', async
 })
 
 test('u2: 🔥バッジがあるときは詳細文に連続を重ねて書かない', () => {
-  const s = VIEW({ card: { detail: 'build ・ 2/4 ・ 🔥3連続' } })
+  const s = VIEW({ detail: 'build ・ 2/4 ・ 🔥3連続' })
   expect((s.match(/🔥/g) ?? []).length).toBe(1)
 })
 
@@ -503,7 +517,16 @@ test('hint: 作業フォルダが途中で移っても、最初に伝えたパ�
     return { value: undefined } as any
   })
   on('audio.play', () => ({ value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', ($, e: any) => {
+    toasts.push(String(e.text))
+    return { value: undefined }
+  })
+  on('agent.list', () => ({ value: agents }) as any)
+  on('store.get', ($, e: any) => ({ value: store[e.key] }))
+  on('store.set', ($, e: any) => {
+    store[e.key] = e.value
+    return { value: undefined }
+  })
   on('ui.status', () => ({ value: undefined }))
   on('turn.complete', () => ({ text: '' }))
   on('command.register', () => ({ value: undefined }) as any)
@@ -530,4 +553,134 @@ test('hint: 作業フォルダが途中で移っても、最初に伝えたパ�
   const logs = written.filter(p => p.endsWith('done-board-debug.log'))
   expect(logs.length).toBeGreaterThan(0)
   expect(new Set(logs)).toEqual(new Set(['/w/.claude/done-board-debug.log']))
+})
+
+// ---- ニャンコ: 経験値・レベル・野良猫バトル・早送り・消音 ----
+
+test('nyanko: 消費トークン 500 ごとに 1 EXP、キャッシュ読み込みは数えない', () => {
+  expect(xpFromUsage({ input_tokens: 800, output_tokens: 1200, cache_read_input_tokens: 90000 })).toBe(4)
+  expect(xpFromUsage(undefined)).toBe(0)
+})
+
+test('nyanko: レベルは累計 EXP で決まる（Lv2=50、Lv5=500）', () => {
+  expect(xpToReach(2)).toBe(50)
+  expect(levelOf(0).level).toBe(1)
+  expect(levelOf(49).level).toBe(1)
+  expect(levelOf(50).level).toBe(2)
+  expect(levelOf(500).level).toBe(5)
+  const mid = levelOf(75)
+  expect(mid.current).toBe(25)
+  expect(mid.need).toBe(100)
+})
+
+test('nyanko: バトルは種が同じなら同じ結果で、必ず決着する', () => {
+  const enemy = pickEnemy(0.9, 3)
+  const a = simulateBattle(42, 3, enemy)
+  const b = simulateBattle(42, 3, enemy)
+  expect(a).toEqual(b)
+  expect(a.steps.length).toBeGreaterThan(0)
+  expect(['win', 'lose']).toContain(a.result)
+  expect(a.xp).toBeGreaterThan(0)
+})
+
+test('nyanko: Lv3 からはまれにボス猫クロが出る', () => {
+  expect(pickEnemy(0.1, 3).isBoss).toBe(true)
+  expect(pickEnemy(0.1, 2).isBoss).toBe(false)
+})
+
+test('nyanko: ターンのトークンで経験値がたまり、レベルが上がると音とトーストで知らせる', async ($, on) => {
+  mock.clock(on)
+  const sounds: string[] = []
+  const store: Record<string, unknown> = {}
+  stub(on, null, sounds, undefined, [], store)
+  await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1000, isAborted: false, turnId: 't1', usage: { input_tokens: 20000, output_tokens: 6000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, model: 'm' } } as any)
+  expect(store.xp).toBe(52)
+  expect(sounds).toContain('sounds/lvup.wav')
+  expect(toasts.join(' ')).toMatch(/Lv\.2/)
+})
+
+test('nyanko: サブエージェントが動いている間は早送りの曲、終わったら元の曲', async ($, on) => {
+  const clock = mock.clock(on)
+  const sounds: string[] = []
+  stub(on, HALF, sounds)
+  await $.turn.start({ text: 'work', turnId: 't1' })
+  agents = [{ status: 'running' }]
+  await clock.advance(4000)
+  agents = [{ status: 'completed' }]
+  await clock.advance(4000)
+  console.log(`SOUND turbo     | ${sounds.join(' → ')}`)
+  expect(sounds).toEqual(['sounds/bgm-groove.m4a (loop)', 'sounds/levelup.wav', 'sounds/bgm-turbo.m4a (loop)', 'sounds/bgm-groove.m4a (loop)'])
+})
+
+test('nyanko: サブエージェントのターン終了では看板を出さない', async ($, on) => {
+  mock.clock(on)
+  const sounds: string[] = []
+  stub(on, ALL_DONE, sounds)
+  await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1000, isAborted: false, turnId: 'sub', agentId: 'a1' } as any)
+  expect((await band($)).text).not.toMatch(/依頼 完了/)
+  expect(sounds).not.toContain('sounds/fanfare.wav')
+})
+
+test('nyanko: /nyanko battle で野良猫と戦い、決着で経験値が入って場面が閉じる', async ($, on) => {
+  const clock = mock.clock(on)
+  const sounds: string[] = []
+  const store: Record<string, unknown> = {}
+  stub(on, null, sounds, undefined, [], store)
+  const r = await $.command.run({ command: 'nyanko', args: 'battle', origin: 'user' } as any)
+  expect(r.text).toMatch(/あらわれた/)
+  const first = await band($)
+  console.log(`RENDER battle0  | ${first.text}`)
+  expect(first.text).toMatch(/あらわれた/)
+  await clock.advance(30000)
+  console.log(`SOUND battle    | ${sounds.join(' → ')}`)
+  expect(sounds[0]).toBe('sounds/encounter.wav')
+  expect(sounds).toContain('sounds/hit.wav')
+  expect(sounds.some(x => x === 'sounds/win.wav' || x === 'sounds/lose.wav')).toBe(true)
+  expect(Number(store.xp)).toBeGreaterThan(0)
+  expect((await band($)).text).not.toMatch(/あらわれた|WIN|にげ/)
+})
+
+test('nyanko: 🔊 ボタンで消音すると BGM も効果音も止まり、設定が残る', async ($, on) => {
+  const clock = mock.clock(on)
+  const sounds: string[] = []
+  const store: Record<string, unknown> = {}
+  let ledger: Ledger = HALF
+  stub(on, () => ledger, sounds, undefined, [], store)
+  await $.turn.start({ text: 'work', turnId: 't1' })
+  const ui = await $.ui.mount({ plugin: 'done-board', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 100 } })
+  await ui.press({ key: 'mute' })
+  expect(store.muted).toBe(true)
+  const before = sounds.length
+  ledger = { status: 'running', items: [{ id: 'a', status: 'done' }, { id: 'b', status: 'done' }, { id: 'c', status: 'pending' }] }
+  await clock.advance(4000)
+  expect(sounds.length).toBe(before)
+  expect(flatten(await ui.drawn())).toMatch(/🔇/)
+})
+
+test('nyanko: デスクトップでは何もなくても帯が常に出て、猫のコマ絵とレベルを描く', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  const { svg, source } = await svgOf($, 'idle')
+  expect(svg).toBeDefined()
+  expect(source).toMatch(/Lv\.1/)
+  expect(source).toMatch(/ひと休み中/)
+  expect(source).toMatch(/<image href="data:image\/png;base64,/)
+  expect(source).toMatch(/data-pose="sleep"/)
+})
+
+test('nyanko: 帯の SVG は上限（131072 文字）に収まる', () => {
+  const big = { uri: `data:image/png;base64,${'A'.repeat(8000)}`, width: 100, height: 96 }
+  const s = stripSvg({ width: 760, accent: 'progress', pose: 'run', cat: big, title: 't', detail: 'd', ratio: 0.5, steps: Array(24).fill('done'), level: 9, xpCurrent: 10, xpNeed: 100, playing: 'x', tierRank: 4, streak: 5, isMuted: false, id: 1 })
+  expect(s.length).toBeLessThan(131072)
+})
+
+test('config: battles を切ると野良猫は出ない（何ターン続いても）', { options: { battles: false } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const sounds: string[] = []
+  stub(on, null, sounds)
+  for (let i = 0; i < 40; i++) {
+    await turn($)
+    await clock.advance(3000)
+  }
+  expect(sounds).not.toContain('sounds/encounter.wav')
 })

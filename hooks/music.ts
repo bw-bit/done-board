@@ -1,12 +1,14 @@
 // 作業BGMのテンポ段階と、連続達成のご褒美の決め方（$ を使わない純粋な関数だけ）
 
-export type Tier = 'calm' | 'groove' | 'drive' | 'sprint'
+export type Tier = 'calm' | 'groove' | 'drive' | 'sprint' | 'turbo'
 
 export const TIERS: Record<Tier, { asset: string; label: string; rank: number }> = {
   calm: { asset: 'sounds/bgm-calm.m4a', label: 'ウォームアップ ×0.92', rank: 0 },
   groove: { asset: 'sounds/bgm-groove.m4a', label: 'グルーヴ ×1.0', rank: 1 },
   drive: { asset: 'sounds/bgm-drive.m4a', label: 'ドライブ ×1.1', rank: 2 },
   sprint: { asset: 'sounds/bgm-sprint.m4a', label: 'ラストスパート ×1.22', rank: 3 },
+  // サブエージェントが動いている間だけ流す早送りの曲
+  turbo: { asset: 'sounds/bgm-turbo.m4a', label: '早送り ×1.5', rank: 4 },
 }
 
 // 進み具合でテンポを上げる: 序盤はゆったり、残り1件で全力

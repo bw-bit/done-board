@@ -1,10 +1,12 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Card, Kind } from '../types'
+import type { BattleState, Card, Kind } from '../types'
 import type { Tier } from './music'
 import { TIERS, comboAsset, isFaster, streakLabel, tierFor } from './music'
-import { cardSvg } from './card-svg'
+import type { Pose, Sprite } from './cat-svg'
+import { HEIGHT, battleSvg, stripSvg } from './cat-svg'
+import { levelOf, pickEnemy, shouldEncounter, simulateBattle, xpFromUsage } from './game'
 
 const card = atom({ plugin: 'done-board', key: 'card' } as const, null)
 const lastSig = atom({ plugin: 'done-board', key: 'lastSig' } as const, null)
@@ -13,6 +15,11 @@ const nowPlaying = atom({ plugin: 'done-board', key: 'nowPlaying' } as const, nu
 const streak = atom({ plugin: 'done-board', key: 'streak' } as const, 0)
 const ledgerPath = atom({ plugin: 'done-board', key: 'ledgerPath' } as const, null)
 const logPath = atom({ plugin: 'done-board', key: 'logPath' } as const, null)
+const xpAtom = atom({ plugin: 'done-board', key: 'xp' } as const, 0)
+const isMuted = atom({ plugin: 'done-board', key: 'isMuted' } as const, false)
+const battle = atom({ plugin: 'done-board', key: 'battle' } as const, null)
+const agentsRunning = atom({ plugin: 'done-board', key: 'agentsRunning' } as const, 0)
+const wins = atom({ plugin: 'done-board', key: 'wins' } as const, 0)
 
 type Item = { id: string; status: string; note?: string }
 type Ledger = { status?: string; request_summary?: string; items?: Item[] }
@@ -46,8 +53,8 @@ type Decision = { card: Card; isAudible: boolean }
 const POLL_MS = 4000
 
 // userConfig の値（register で受け取る）。既定値は plugin.json と同じ
-type Config = { ledgerDir: string; music: boolean; musicVolume: number; effects: boolean; debugLog: boolean; promptHint: boolean }
-let config: Config = { ledgerDir: 'work/autonomy', music: true, musicVolume: 0.35, effects: true, debugLog: false, promptHint: true }
+type Config = { ledgerDir: string; music: boolean; musicVolume: number; effects: boolean; debugLog: boolean; promptHint: boolean; battles: boolean }
+let config: Config = { ledgerDir: 'work/autonomy', music: true, musicVolume: 0.35, effects: true, debugLog: false, promptHint: true, battles: true }
 
 function readConfig(options: Readonly<Record<string, unknown>>): Config {
   const volume = Number(options.musicVolume)
@@ -58,12 +65,13 @@ function readConfig(options: Readonly<Record<string, unknown>>): Config {
     effects: options.effects !== false,
     debugLog: options.debugLog === true,
     promptHint: options.promptHint !== false,
+    battles: options.battles !== false,
   }
 }
 
 // 効果音（BGM 以外）。設定で切ってあれば鳴らさない
 async function playEffect($: any, asset: string): Promise<void> {
-  if (!config.effects) return
+  if (!config.effects || (await read($, isMuted))) return
   await $.audio.play({ asset }).catch(() => undefined)
 }
 
@@ -76,6 +84,18 @@ let seenDone = 0
 // turn.start で台帳の完了数を数え終えたか（数える前の完了は連続に入れない）
 let isBaselined = false
 let isCelebrated = false
+// メインのターンが動いているか・最後に見た進み具合（BGM を戻すときに使う）
+let isTurnActive = false
+let lastDone = 0
+let lastTotal = 0
+// 動いているサブエージェントの数と、メインのターンが終わった後もそれを見張るタイマー
+let runningAgents = 0
+let agentPoll: { cancel: () => void } | undefined
+// 前回のバトルから何ターンたったか・バトルの場面を進めるタイマー
+let turnsSinceBattle = 0
+let battleTimers: { cancel: () => void }[] = []
+// 読み込んだコマ絵（sprites/*.png）
+const spriteCache = new Map<string, Sprite | null>()
 
 // 134 → 「2分14秒」、3700 → 「1時間1分」
 function formatDuration(seconds: number): string {
@@ -248,12 +268,15 @@ function stopBgm(): void {
 
 // 進み具合に合ったテンポのBGMへ切り替える。速くなるときはレベルアップ音を鳴らす
 async function syncMusic($: any, done: number, total: number): Promise<void> {
-  if (!config.music || !(await read($, isMusicOn))) {
+  lastDone = done
+  lastTotal = total
+  if (!config.music || !(await read($, isMusicOn)) || (await read($, isMuted))) {
     stopBgm()
     await update($, nowPlaying, () => null)
     return
   }
-  const tier = tierFor(done, total)
+  // サブエージェントが動いている間は早送りの曲
+  const tier: Tier = runningAgents > 0 ? 'turbo' : tierFor(done, total)
   if (bgm?.tier === tier) return
   if (isFaster(tier, bgm?.tier)) await playEffect($, 'sounds/levelup.wav')
   stopBgm()
@@ -270,8 +293,153 @@ async function hasOpenItems($: any): Promise<boolean> {
 }
 
 async function silence($: any): Promise<void> {
+  // サブエージェントがまだ動いていれば、早送りの曲は止めない
+  if (runningAgents > 0) {
+    await syncMusic($, lastDone, lastTotal)
+    return
+  }
   stopBgm()
   await update($, nowPlaying, () => null)
+}
+
+// サブエージェントの数を数え直し、増減したら曲を切り替える
+async function refreshAgents($: any): Promise<void> {
+  const list = (await $.agent.list().catch(() => [])) as { status: string }[]
+  const n = list.filter(a => a.status === 'running' || a.status === 'pending').length
+  if (n === runningAgents) return
+  runningAgents = n
+  await update($, agentsRunning, () => n)
+  if (n > 0 || isTurnActive) {
+    await syncMusic($, lastDone, lastTotal)
+  } else {
+    agentPoll?.cancel()
+    agentPoll = undefined
+    if (!(await hasOpenItems($))) await silence($)
+    else await syncMusic($, lastDone, lastTotal)
+  }
+}
+
+// コマ絵を読み込む。PNG の幅と高さはヘッダから読む
+async function spriteOf($: any, name: string): Promise<Sprite | null> {
+  if (spriteCache.has(name)) return spriteCache.get(name) ?? null
+  let sprite: Sprite | null = null
+  try {
+    const got = await $.fs.read(`${$.plugin.root}/sprites/${name}.png`, { as: 'bytes' })
+    const base64 = typeof got === 'object' && got !== null ? String((got as { base64?: string }).base64 ?? '') : ''
+    const head = atob(base64.slice(0, 44))
+    const dim = (o: number) => ((head.charCodeAt(o) << 24) | (head.charCodeAt(o + 1) << 16) | (head.charCodeAt(o + 2) << 8) | head.charCodeAt(o + 3)) >>> 0
+    if (head.slice(1, 4) === 'PNG') sprite = { uri: `data:image/png;base64,${base64}`, width: dim(16), height: dim(20) }
+  } catch {
+    sprite = null
+  }
+  spriteCache.set(name, sprite)
+  return sprite
+}
+
+// 経験値を足し、レベルが上がったら知らせる
+async function addXp($: any, gained: number): Promise<void> {
+  if (gained <= 0) return
+  const before = levelOf(await read($, xpAtom)).level
+  const xp = (await update($, xpAtom, (n: number) => n + gained)) as number
+  await $.store.set('xp', xp).catch(() => undefined)
+  const after = levelOf(xp).level
+  if (after > before) {
+    await playEffect($, 'sounds/lvup.wav')
+    $.ui.toast(`🎉 ニャンコが Lv.${after} にレベルアップ！`)
+  }
+}
+
+function cancelBattle(): void {
+  for (const t of battleTimers) t.cancel()
+  battleTimers = []
+}
+
+async function patchBattle($: any, id: number, patch: Partial<BattleState> | null): Promise<void> {
+  await update($, battle, (cur: BattleState | null) => {
+    if (cur === null || cur.id !== id) return cur
+    return patch === null ? null : { ...cur, ...patch }
+  })
+}
+
+// 野良猫バトル: 遭遇 → 交互に攻撃 → 勝ち負け → 経験値。1手ずつ 1.1 秒で進める
+const BATTLE_INTRO_MS = 1400
+const BATTLE_STEP_MS = 1100
+const BATTLE_OUTRO_MS = 3500
+
+async function startBattle($: any): Promise<void> {
+  if ((await read($, battle)) !== null) return
+  cancelBattle()
+  const level = levelOf(await read($, xpAtom)).level
+  const enemy = pickEnemy(Math.random(), level)
+  const fight = simulateBattle(Math.floor(Math.random() * 2 ** 31), level, enemy)
+  seq += 1
+  const id = seq
+  await update($, battle, () => ({
+    enemyId: enemy.id,
+    enemyName: enemy.name,
+    enemyLevel: enemy.level,
+    enemyHp: enemy.hp,
+    enemyMaxHp: enemy.hp,
+    playerHp: fight.playerMaxHp,
+    playerMaxHp: fight.playerMaxHp,
+    text: `${enemy.name}（Lv.${enemy.level}）があらわれた！`,
+    hitBy: null,
+    result: null,
+    catPose: 'wait' as const,
+    id,
+  }))
+  await playEffect($, 'sounds/encounter.wav')
+  fight.steps.forEach((step, i) => {
+    battleTimers.push($.clock.after(BATTLE_INTRO_MS + i * BATTLE_STEP_MS, () => {
+      void patchBattle($, id, {
+        playerHp: step.playerHp,
+        enemyHp: step.enemyHp,
+        text: step.text,
+        hitBy: step.actor,
+        catPose: step.actor === 'player' ? 'attack' : 'hurt',
+      }).then(() => playEffect($, 'sounds/hit.wav'))
+    }))
+  })
+  const endAt = BATTLE_INTRO_MS + fight.steps.length * BATTLE_STEP_MS
+  battleTimers.push($.clock.after(endAt, () => {
+    const isWin = fight.result === 'win'
+    void patchBattle($, id, {
+      result: fight.result,
+      hitBy: null,
+      catPose: isWin ? 'joy' : 'hurt',
+      text: isWin ? `${enemy.name}をやっつけた！ +${fight.xp} EXP` : `ニャンコはにげだした… +${fight.xp} EXP`,
+    })
+      .then(() => playEffect($, isWin ? 'sounds/win.wav' : 'sounds/lose.wav'))
+      .then(() => addXp($, fight.xp))
+      .then(async () => {
+        if (!isWin) return
+        const w = (await update($, wins, (n: number) => n + 1)) as number
+        await $.store.set('wins', w).catch(() => undefined)
+      })
+  }))
+  battleTimers.push($.clock.after(endAt + BATTLE_OUTRO_MS, () => void patchBattle($, id, null)))
+}
+
+async function toggleMute($: any): Promise<void> {
+  const muted = (await update($, isMuted, (m: boolean) => !m)) as boolean
+  await $.store.set('muted', muted).catch(() => undefined)
+  if (muted) {
+    stopBgm()
+    await update($, nowPlaying, () => null)
+  } else if (isTurnActive || runningAgents > 0) {
+    await syncMusic($, lastDone, lastTotal)
+  }
+}
+
+// 帯の猫のポーズ: 完了で跳ね、要対応で待ち、BGM の速さで歩く・走る、何もなければ眠る
+function poseFor(cur: Card | null, isWorking: boolean): Pose {
+  if (cur?.kind === 'done' && cur.phase !== 'fading') return 'joy'
+  if (cur?.kind === 'blocked') return 'wait'
+  const tier = bgm?.tier
+  if (tier === 'turbo' || tier === 'sprint') return 'sprint'
+  if (tier === 'drive') return 'run'
+  if (tier !== undefined || isWorking || runningAgents > 0) return 'walk'
+  return 'sleep'
 }
 
 function countDone(items: Item[]): number {
@@ -316,6 +484,14 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await beat($, 'session.start')
     await $.command.register({ name: 'bgm', description: '作業BGMを切り替える（/bgm on・/bgm off・/bgm で状態）' })
+    await $.command.register({ name: 'nyanko', description: 'ニャンコの状態を見る（/nyanko battle で野良猫と戦う、/nyanko mute で消音を切り替え）' })
+    // セッションをまたいで残す値を読み戻す
+    const savedXp = Number(await $.store.get('xp').catch(() => 0)) || 0
+    const savedWins = Number(await $.store.get('wins').catch(() => 0)) || 0
+    const savedMuted = (await $.store.get('muted').catch(() => false)) === true
+    await update($, xpAtom, () => savedXp)
+    await update($, wins, () => savedWins)
+    await update($, isMuted, () => savedMuted)
     return next(e)
   })
 
@@ -334,6 +510,20 @@ export const register: Register = (on, options) => {
     return { text: `作業BGM: ${(await read($, isMusicOn)) ? 'オン' : 'オフ'} ・ ${playing ?? '停止中'} ・ 連続 ${await read($, streak)}` }
   })
 
+  on('command.run', { command: 'nyanko' }, async ($, e) => {
+    const arg = e.args.trim()
+    if (arg === 'battle') {
+      await startBattle($)
+      return { text: '野良猫があらわれた！ 入力欄の上の帯を見てください。' }
+    }
+    if (arg === 'mute') {
+      await toggleMute($)
+      return { text: (await read($, isMuted)) ? '音を消しました。' : '音を戻しました。' }
+    }
+    const info = levelOf(await read($, xpAtom))
+    return { text: `ニャンコ Lv.${info.level} ・ EXP ${info.current}/${info.need} ・ 勝利 ${await read($, wins)} ・ 音 ${(await read($, isMuted)) ? 'オフ' : 'オン'}` }
+  })
+
   on('prompt.compose', async ($, e, next) => {
     const result = await next(e)
     if (!config.promptHint) return result
@@ -347,6 +537,7 @@ export const register: Register = (on, options) => {
 
   on('turn.start', async ($, e, next) => {
     poll?.cancel()
+    isTurnActive = true
     const { ledger } = await readLedger($)
     const items = ledger?.items ?? []
     seenDone = countDone(items)
@@ -355,7 +546,10 @@ export const register: Register = (on, options) => {
     // 終わった依頼の台帳しかなければ、新しい作業としてゆったり始める
     const isFinished = items.length > 0 && seenDone === items.length
     await syncMusic($, isFinished ? 0 : seenDone, isFinished ? 0 : items.length)
-    poll = $.clock.every(POLL_MS, () => void pollLedger($).catch(() => undefined))
+    poll = $.clock.every(POLL_MS, () => {
+      void pollLedger($).catch(() => undefined)
+      void refreshAgents($).catch(() => undefined)
+    })
     return next(e)
   })
 
@@ -367,8 +561,21 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    // 消費したトークンは、サブエージェントの分も経験値にする
+    await addXp($, xpFromUsage(e.usage as any)).catch(() => undefined)
+    if (e.agentId !== undefined) {
+      // サブエージェントのターンの終わり: 看板は出さず、早送りを続けるかだけ見直す
+      await refreshAgents($).catch(() => undefined)
+      return result
+    }
     poll?.cancel()
     poll = undefined
+    isTurnActive = false
+    // バックグラウンドのサブエージェントが残っていれば、終わるまで見張る
+    await refreshAgents($).catch(() => undefined)
+    if (runningAgents > 0 && agentPoll === undefined) {
+      agentPoll = $.clock.every(POLL_MS, () => void refreshAgents($).catch(() => undefined))
+    }
     if (e.reason !== 'answer') {
       await silence($)
       return result
@@ -391,38 +598,101 @@ export const register: Register = (on, options) => {
     await show($, withStreak, decision.isAudible)
     await beat($, 'turn.complete', { kind: decision.card.kind, title: decision.card.title, detail: decision.card.detail })
     if (decision.card.kind === 'done') $.ui.toast(`🎉 ${decision.card.title}: ${decision.card.detail}`)
+    // たまに近所の野良猫が出てくる
+    turnsSinceBattle += 1
+    if (config.battles && shouldEncounter(Math.random(), turnsSinceBattle)) {
+      turnsSinceBattle = 0
+      timers.push($.clock.after(2500, () => void startBattle($).catch(() => undefined)))
+    }
     return result
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
     const cur = await read($, card)
+    const fight = await read($, battle)
     if (cur !== null) await beat($, 'ui.render', { surface: e.surface, kind: cur.kind, phase: cur.phase })
-    if (e.props.hasSurvey || cur === null) return next(e)
 
     const playing = await read($, nowPlaying)
-    const isFading = cur.phase === 'fading'
-    const icon = cur.phase === 'pop' ? POP_FRAMES[cur.frame] ?? ICON[cur.kind] : ICON[cur.kind]
+    const muted = await read($, isMuted)
+    const info = levelOf(await read($, xpAtom))
+    const isFading = cur?.phase === 'fading'
+    const icon = cur === null ? '' : cur.phase === 'pop' ? POP_FRAMES[cur.frame] ?? ICON[cur.kind] : ICON[cur.kind]
     const close = () => update($, card, () => null)
+    const isWorking = e.props.isWorking === true
+    const ratio = cur !== null && cur.total > 0 ? cur.done / cur.total : lastTotal > 0 ? lastDone / lastTotal : null
+    const idleTitle = runningAgents > 0 ? `サブエージェント ${runningAgents} 体が作業中` : isWorking ? '作業中…' : 'ひと休み中'
+    const idleDetail = `次のレベルまで ${info.need - info.current} EXP ・ 勝利 ${await read($, wins)}`
+    const title = cur !== null ? `${icon} ${cur.title}${ratio !== null ? `  ${Math.round(ratio * 100)}%` : ''}` : idleTitle
+    const detail = cur !== null ? cur.detail : idleDetail
 
     if (e.surface === 'desktop') {
       const t = $.ui.resolve(e)
-      const width = Math.max(360, Math.min(720, e.props.bodyColumns * 8))
-      const alt = `${cur.title} ${cur.detail}${playing !== null ? ` ・ ♪ ${playing}` : ''}`
+      const width = Math.max(420, Math.min(760, e.props.bodyColumns * 8))
+      const pose = poseFor(cur, isWorking)
+      const source = fight !== null
+        ? battleSvg({
+            width,
+            cat: await spriteOf($, fight.catPose),
+            enemy: await spriteOf($, fight.enemyId),
+            catPose: fight.catPose,
+            enemyName: fight.enemyName,
+            enemyLevel: fight.enemyLevel,
+            playerHp: fight.playerHp,
+            playerMaxHp: fight.playerMaxHp,
+            enemyHp: fight.enemyHp,
+            enemyMaxHp: fight.enemyMaxHp,
+            text: fight.text,
+            hitBy: fight.hitBy,
+            result: fight.result,
+            level: info.level,
+            xpCurrent: info.current,
+            xpNeed: info.need,
+            id: fight.id,
+          })
+        : stripSvg({
+            width,
+            accent: cur?.kind ?? 'idle',
+            pose,
+            cat: await spriteOf($, pose),
+            title,
+            detail,
+            ratio,
+            steps: cur?.steps ?? [],
+            level: info.level,
+            xpCurrent: info.current,
+            xpNeed: info.need,
+            playing,
+            tierRank: bgm ? TIERS[bgm.tier].rank : undefined,
+            streak: await read($, streak),
+            isMuted: muted,
+            id: cur?.id ?? 0,
+          })
+      const alt = fight !== null ? `${fight.text} ・ ニャンコ Lv.${info.level}` : `${title} ${detail} ・ ニャンコ Lv.${info.level}${playing !== null ? ` ・ ♪ ${playing}` : ''}`
       return (
         <t.Box flexDirection="row" alignItems="center" gap={1}>
-          <t.Svg
-            source={cardSvg({ card: cur, icon, playing, width, tierRank: bgm ? TIERS[bgm.tier].rank : undefined, streak: await read($, streak) })}
-            alt={alt}
-            width={width}
-            height={88}
-            isInteractive
-          />
-          <t.Button key="close" label="✕" onPress={close} />
+          <t.Svg source={source} alt={alt} width={width} height={HEIGHT} isInteractive />
+          <t.Box flexDirection="column" gap={1}>
+            <t.Button key="mute" label={muted ? '🔇' : '🔊'} onPress={() => toggleMute($)} />
+            {cur !== null ? <t.Button key="close" label="✕" onPress={close} /> : null}
+          </t.Box>
         </t.Box>
       )
     }
 
     const { Box, Text, Button } = $.ui.resolve(e)
+    const gauge = `${'▰'.repeat(Math.round(info.ratio * 8))}${'▱'.repeat(8 - Math.round(info.ratio * 8))}`
+    const status = (
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text>{fight !== null ? `🐈 vs 🐈‍⬛ ${fight.text}` : `🐈 ${cur === null ? idleTitle : ''}`}</Text>
+        <Box flexDirection="row">
+          <Text color="warning">Lv.{info.level} {gauge} </Text>
+          {playing !== null && !muted ? <Text color="claude">♪ {playing}  </Text> : null}
+          <Button key="mute" label={muted ? '🔇' : '🔊'} onPress={() => toggleMute($)} />
+        </Box>
+      </Box>
+    )
+    if (cur === null) return status
     // 消える直前は色を落として薄く見せる
     const accent = isFading ? { dimColor: true } : { color: COLOR[cur.kind], bold: true }
     return (
@@ -432,12 +702,10 @@ export const register: Register = (on, options) => {
             <Text {...accent}>{icon} {cur.title}</Text>
             {cur.total > 0 ? <Text {...accent} bold={false}> {progressBar(cur.done, cur.total)}</Text> : null}
           </Box>
-          <Box flexDirection="row">
-            {playing !== null ? <Text color="claude">♪ {playing}  </Text> : null}
-            <Button key="close" label="✕" onPress={close} />
-          </Box>
+          <Button key="close" label="✕" onPress={close} />
         </Box>
         <Text dimColor wrap="truncate-end">{cur.detail}</Text>
+        {status}
       </Box>
     )
   })

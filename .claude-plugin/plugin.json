@@ -1,17 +1,19 @@
 {
   "name": "done-board",
-  "version": "1.1.1",
-  "description": "作業の進み具合を看板・作業BGM・ご褒美の音で見せる。完了台帳を読み、項目を終えるたびにコンボ音、残りが減るほどBGMが速くなる",
+  "version": "1.2.0",
+  "description": "作業の進み具合を、常時表示のニャンコ・作業BGM・ご褒美の音で見せる。消費トークンで経験値がたまり、たまに野良猫とバトル。サブエージェント中は早送りの曲",
   "types": "./types/index.d.ts",
   "author": {
     "name": "bw-bit"
   },
   "license": "MIT",
   "keywords": [
-    "productivity",
     "bgm",
-    "progress",
-    "gamification"
+    "cat",
+    "game",
+    "gamification",
+    "productivity",
+    "progress"
   ],
   "userConfig": {
     "ledgerDir": {
@@ -48,6 +50,12 @@
       "type": "boolean",
       "title": "台帳の書き方を Claude に伝える",
       "description": "システムプロンプトに台帳の場所と形式を加える。切ると、自分で台帳を書く仕組みが別にある場合だけ動く",
+      "default": true
+    },
+    "battles": {
+      "type": "boolean",
+      "title": "野良猫バトル",
+      "description": "ターンの終わりに、ときどき野良猫が出てきて戦う",
       "default": true
     }
   }
