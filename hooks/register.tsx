@@ -11,6 +11,8 @@ const lastSig = atom({ plugin: 'done-board', key: 'lastSig' } as const, null)
 const isMusicOn = atom({ plugin: 'done-board', key: 'isMusicOn' } as const, true)
 const nowPlaying = atom({ plugin: 'done-board', key: 'nowPlaying' } as const, null)
 const streak = atom({ plugin: 'done-board', key: 'streak' } as const, 0)
+const ledgerPath = atom({ plugin: 'done-board', key: 'ledgerPath' } as const, null)
+const logPath = atom({ plugin: 'done-board', key: 'logPath' } as const, null)
 
 type Item = { id: string; status: string; note?: string }
 type Ledger = { status?: string; request_summary?: string; items?: Item[] }
@@ -93,11 +95,16 @@ function progressBar(done: number, total: number): string {
   return `${'█'.repeat(filled)}${'░'.repeat(BAR_CELLS - filled)} ${Math.round((done / total) * 100)}%`
 }
 
-// このセッションの台帳を書く場所（Claude に伝える絶対パス）
+// このセッションの台帳を書く場所（Claude に伝える絶対パス）。一度伝えたら $.state に残し、
+// 作業フォルダが途中で移っても同じパスを伝え続ける
 async function ledgerPathFor($: any): Promise<string> {
+  const told = await read($, ledgerPath)
+  if (told !== null) return told
   const id = await $.session.id()
   const dir = config.ledgerDir.startsWith('/') ? config.ledgerDir : `${await $.session.cwd()}/${config.ledgerDir}`
-  return `${dir}/completion-${id}.json`
+  const path = `${dir}/completion-${id}.json`
+  await update($, ledgerPath, () => path)
+  return path
 }
 
 // Claude は自分のセッション ID を知らないので、台帳の場所と書き方をシステムプロンプトで伝える
@@ -112,15 +119,21 @@ function ledgerHint(path: string): string {
   ].join('\n')
 }
 
-// 完了台帳は work/autonomy/completion-<session_id>.json。置き場の違いに備えて複数候補を探す
-async function readLedger($: any): Promise<LedgerRead> {
+// 完了台帳は work/autonomy/completion-<session_id>.json。Claude に伝えたパスを最初に見て、
+// なければ（伝える前・伝えなかった場合）作業フォルダとリポジトリのルートから探す
+async function ledgerCandidates($: any): Promise<string[]> {
+  const told = await read($, ledgerPath)
   const id = await $.session.id()
   const cwd = await $.session.cwd()
   const root = await $.session.root().catch(() => cwd)
   // 絶対パスならそのまま、相対パスなら作業フォルダとリポジトリのルートから探す
   const bases = config.ledgerDir.startsWith('/') ? [''] : [`${cwd}/`, `${root}/`]
-  for (const base of bases) {
-    const path = `${base}${config.ledgerDir}/completion-${id}.json`
+  const found = bases.map(base => `${base}${config.ledgerDir}/completion-${id}.json`)
+  return [...new Set(told !== null ? [told, ...found] : found)]
+}
+
+async function readLedger($: any): Promise<LedgerRead> {
+  for (const path of await ledgerCandidates($)) {
     if (!(await $.fs.exists(path))) continue
     try {
       return { ledger: JSON.parse(await $.fs.read(path)) as Ledger }
@@ -133,10 +146,16 @@ async function readLedger($: any): Promise<LedgerRead> {
   return { ledger: null }
 }
 
-// 診断用の記録（設定 debugLog がオンのときだけ）。作業フォルダの .claude/done-board-debug.log に直近 40 行を残す
+// 診断用の記録（設定 debugLog がオンのときだけ）。作業フォルダの .claude/done-board-debug.log に直近 40 行を残す。
+// 場所は最初に書いたときに決め、作業フォルダが移っても同じファイルに書き続ける
 async function beat($: any, event: string, extra: Record<string, unknown> = {}): Promise<void> {
   if (!config.debugLog) return
-  const path = `${await $.session.cwd()}/.claude/done-board-debug.log`
+  let path = await read($, logPath)
+  if (path === null) {
+    const first = `${await $.session.cwd()}/.claude/done-board-debug.log`
+    await update($, logPath, () => first)
+    path = first
+  }
   const surface = await $.session.surface().catch(() => null)
   const line = JSON.stringify({ event, surface, at: new Date(await $.clock.now()).toISOString(), ...extra })
   const prev = await $.fs.read(path).catch(() => '')

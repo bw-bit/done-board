@@ -1,6 +1,6 @@
 {
   "name": "done-board",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "作業の進み具合を看板・作業BGM・ご褒美の音で見せる。完了台帳を読み、項目を終えるたびにコンボ音、残りが減るほどBGMが速くなる",
   "types": "./types/index.d.ts",
   "author": {

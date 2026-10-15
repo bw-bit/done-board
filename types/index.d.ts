@@ -27,6 +27,10 @@ declare module 'claude-code' {
       nowPlaying: string | null
       // 連続で終えた項目数。依頼が終わるとリセット
       streak: number
+      // Claude に伝えた台帳の絶対パス。作業フォルダが途中で移っても、まずここを読む
+      ledgerPath: string | null
+      // 診断ログの絶対パス。最初に決めた場所に書き続ける
+      logPath: string | null
     }
   }
 }

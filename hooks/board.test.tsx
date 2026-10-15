@@ -481,3 +481,53 @@ test('hint: promptHint を切ると加えない', { options: { promptHint: false
   const r = await $.prompt.compose(COMPOSE as any)
   expect(r.sections.map((s: any) => s.id)).toEqual(['intro'])
 })
+
+test('hint: 作業フォルダが途中で移っても、最初に伝えたパスの台帳を読み、診断ログも同じ場所に書く', { options: { debugLog: true } }, async ($, on) => {
+  mock.clock(on)
+  const told = '/w/work/autonomy/completion-sid.json'
+  let cwd = '/w'
+  let root = '/w'
+  const asked: string[] = []
+  const written: string[] = []
+  on('session.id', () => ({ value: 'sid' }))
+  on('session.cwd', () => ({ value: cwd }))
+  on('session.root', () => ({ value: root }))
+  on('session.surface', () => ({ value: 'terminal' }) as any)
+  on('fs.exists', ($, e) => {
+    asked.push(e.path)
+    return { value: e.path === told }
+  })
+  on('fs.read', ($, e) => ({ value: e.path === told ? JSON.stringify(ALL_DONE) : '' }))
+  on('fs.write', ($, e) => {
+    written.push(e.path)
+    return { value: undefined } as any
+  })
+  on('audio.play', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('turn.complete', () => ({ text: '' }))
+  on('command.register', () => ({ value: undefined }) as any)
+  on('prompt.submit', ($, e) => ({ text: e.text }) as any)
+  on('prompt.compose', () => ({ sections: [] }))
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box />
+  })
+
+  await $.session.start({} as any).catch(() => undefined)
+  const first = await $.prompt.compose(COMPOSE as any)
+  expect(first.sections.find((s: any) => s.id === 'done-board:ledger')?.text).toContain(told)
+
+  // Bash の cd などで作業フォルダが移り、ルートも別の場所になった
+  cwd = '/elsewhere/sub'
+  root = '/elsewhere'
+  const again = await $.prompt.compose(COMPOSE as any)
+  expect(again.sections.find((s: any) => s.id === 'done-board:ledger')?.text).toContain(told)
+
+  await turn($)
+  expect(asked[0]).toBe(told)
+  expect((await band($)).text).toMatch(/依頼 完了/)
+  const logs = written.filter(p => p.endsWith('done-board-debug.log'))
+  expect(logs.length).toBeGreaterThan(0)
+  expect(new Set(logs)).toEqual(new Set(['/w/.claude/done-board-debug.log']))
+})
