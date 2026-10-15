@@ -31,6 +31,13 @@ export type BattleState = {
   id: number
 }
 
+// localhost で待ち受けているサーバー（ペインと帯の 🌐 に使う）
+export type ServerRow = { port: number; pid: number; command: string; host: string; cwd?: string; isDev: boolean }
+
+// ツンデレモードのパラメータと、いま出ているセリフ
+export type TsunParams = { affection: number; trust: number; mood: number; isCleared: boolean }
+export type TsunLine = { expression: 'normal' | 'angry' | 'blush' | 'smug' | 'worried' | 'happy'; line: string; at: number; id: number }
+
 declare module 'claude-code' {
   interface PluginState {
     'done-board': {
@@ -57,6 +64,21 @@ declare module 'claude-code' {
       agentsRunning: number
       // バトルの勝利数。$.store にも保存する
       wins: number
+      // 送ったプロンプトの文字（帯に降らせる）。降り終わると null
+      rain: { text: string; id: number } | null
+      // 🐾 で撫でた直後か
+      isPetting: boolean
+      // 撫でた回数。$.store にも保存する
+      pets: number
+      // localhost のサーバー一覧と、止める確認中のポート・全部見せるか
+      servers: ServerRow[]
+      stopArmed: number | null
+      isShowingAllServers: boolean
+      // 帯のキャラクター（nyanko: ニャンコ / tsundere: ツンデレの霧島レイ）。$.store にも保存する
+      character: 'nyanko' | 'tsundere'
+      // ツンデレモードのパラメータ（$.store にも保存）と、いま出ているセリフ
+      tsun: TsunParams
+      tsunLine: TsunLine | null
     }
   }
 }

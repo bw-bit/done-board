@@ -1,7 +1,7 @@
 {
   "name": "done-board",
-  "version": "1.2.1",
-  "description": "作業の進み具合を、常時表示のニャンコ・作業BGM・ご褒美の音で見せる。消費トークンで経験値がたまり、たまに野良猫とバトル。サブエージェント中は早送りの曲",
+  "version": "1.5.0",
+  "description": "作業の進み具合を、常時表示のニャンコ・作業BGM・ご褒美の音で見せる。送ったプロンプトが文字で降り、撫でると喜び、localhost の開発サーバーも管理できる。消費トークンで経験値、たまに野良猫とバトル",
   "types": "./types/index.d.ts",
   "author": {
     "name": "bw-bit"
@@ -57,6 +57,22 @@
       "title": "野良猫バトル",
       "description": "ターンの終わりに、ときどき野良猫が出てきて戦う",
       "default": true
+    },
+    "catTheme": {
+      "type": "boolean",
+      "title": "画面を猫仕立てにする",
+      "description": "考え中の表示・ヒント・確認ダイアログ・ツールの行などに猫を添える",
+      "default": true
+    },
+    "character": {
+      "type": "string",
+      "title": "帯のキャラクター",
+      "description": "nyanko（ニャンコ）か tsundere（ツンデレの霧島レイ）。/tsundere on・off でも切り替えられる",
+      "default": "nyanko",
+      "options": [
+        "nyanko",
+        "tsundere"
+      ]
     }
   }
 }

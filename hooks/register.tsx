@@ -1,12 +1,17 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { BattleState, Card, Kind } from '../types'
+import type { BattleState, Card, Kind, ServerRow, TsunLine, TsunParams } from '../types'
 import type { Tier } from './music'
 import { TIERS, comboAsset, isFaster, streakLabel, tierFor } from './music'
 import type { Pose, Sprite } from './cat-svg'
 import { HEIGHT, battleSvg, stripSvg } from './cat-svg'
 import { levelOf, pickEnemy, shouldEncounter, simulateBattle, xpFromUsage } from './game'
+import { parseCwd, parseListen, shortPath, urlOf } from './localhost'
+import { novelSvg } from './novel-svg'
+import type { Expression, TaskEvent } from './tsundere'
+import { ENDING_LINE, INITIAL, NAME, STAGE_LABEL, apply, cool, giftLine, readPrompt, stageOf, taskLine, toolLine, tsunHint, tsunSpinner, tsunTurnLine } from './tsundere'
+import { catBackgroundHint, catNotice, catQuestions, desktopSpinnerWord, hintTail, spinnerWord, toolFace, turnLine } from './theme'
 
 const card = atom({ plugin: 'done-board', key: 'card' } as const, null)
 const lastSig = atom({ plugin: 'done-board', key: 'lastSig' } as const, null)
@@ -20,6 +25,26 @@ const isMuted = atom({ plugin: 'done-board', key: 'isMuted' } as const, false)
 const battle = atom({ plugin: 'done-board', key: 'battle' } as const, null)
 const agentsRunning = atom({ plugin: 'done-board', key: 'agentsRunning' } as const, 0)
 const wins = atom({ plugin: 'done-board', key: 'wins' } as const, 0)
+const rain = atom({ plugin: 'done-board', key: 'rain' } as const, null)
+const isPetting = atom({ plugin: 'done-board', key: 'isPetting' } as const, false)
+const pets = atom({ plugin: 'done-board', key: 'pets' } as const, 0)
+const servers = atom({ plugin: 'done-board', key: 'servers' } as const, [])
+const stopArmed = atom({ plugin: 'done-board', key: 'stopArmed' } as const, null)
+const isShowingAllServers = atom({ plugin: 'done-board', key: 'isShowingAllServers' } as const, false)
+const character = atom({ plugin: 'done-board', key: 'character' } as const, 'nyanko')
+const tsun = atom({ plugin: 'done-board', key: 'tsun' } as const, INITIAL)
+const tsunLine = atom({ plugin: 'done-board', key: 'tsunLine' } as const, null)
+// セリフが「出たばかり」とみなす時間（1 文字ずつ出す演出を付ける）・ツールのひとことの間隔
+const FRESH_MS = 2500
+const TOOL_LINE_GAP_MS = 4000
+// コーヒーの差し入れは 1 時間に 1 回まで
+const GIFT_GAP_MS = 60 * 60 * 1000
+
+const PANE = 'done-board-localhost'
+// 送ったプロンプトの文字が降っている時間・撫でた反応の時間・localhost を見直す間隔
+const RAIN_MS = 6500
+const PET_MS = 2600
+const SERVER_POLL_MS = 20000
 
 type Item = { id: string; status: string; note?: string }
 type Ledger = { status?: string; request_summary?: string; items?: Item[] }
@@ -53,8 +78,8 @@ type Decision = { card: Card; isAudible: boolean }
 const POLL_MS = 4000
 
 // userConfig の値（register で受け取る）。既定値は plugin.json と同じ
-type Config = { ledgerDir: string; music: boolean; musicVolume: number; effects: boolean; debugLog: boolean; promptHint: boolean; battles: boolean }
-let config: Config = { ledgerDir: 'work/autonomy', music: true, musicVolume: 0.35, effects: true, debugLog: false, promptHint: true, battles: true }
+type Config = { ledgerDir: string; music: boolean; musicVolume: number; effects: boolean; debugLog: boolean; promptHint: boolean; battles: boolean; catTheme: boolean; character: 'nyanko' | 'tsundere' }
+let config: Config = { ledgerDir: 'work/autonomy', music: true, musicVolume: 0.35, effects: true, debugLog: false, promptHint: true, battles: true, catTheme: true, character: 'nyanko' }
 
 function readConfig(options: Readonly<Record<string, unknown>>): Config {
   const volume = Number(options.musicVolume)
@@ -66,6 +91,8 @@ function readConfig(options: Readonly<Record<string, unknown>>): Config {
     debugLog: options.debugLog === true,
     promptHint: options.promptHint !== false,
     battles: options.battles !== false,
+    catTheme: options.catTheme !== false,
+    character: options.character === 'tsundere' ? 'tsundere' : 'nyanko',
   }
 }
 
@@ -94,8 +121,13 @@ let agentPoll: { cancel: () => void } | undefined
 // 前回のバトルから何ターンたったか・バトルの場面を進めるタイマー
 let turnsSinceBattle = 0
 let battleTimers: { cancel: () => void }[] = []
+let rainTimer: { cancel: () => void } | undefined
+let petTimer: { cancel: () => void } | undefined
+let serverPoll: { cancel: () => void } | undefined
 // 読み込んだコマ絵（sprites/*.png）
 const spriteCache = new Map<string, Sprite | null>()
+// ツンデレモード: いま作業中の項目（「次は〜ね」を一度だけ言うため）
+let lastRunningId: string | null = null
 
 // 134 → 「2分14秒」、3700 → 「1時間1分」
 function formatDuration(seconds: number): string {
@@ -307,8 +339,10 @@ async function refreshAgents($: any): Promise<void> {
   const list = (await $.agent.list().catch(() => [])) as { status: string }[]
   const n = list.filter(a => a.status === 'running' || a.status === 'pending').length
   if (n === runningAgents) return
+  const before = runningAgents
   runningAgents = n
   await update($, agentsRunning, () => n)
+  if (n > before) await tsunTask($, { kind: 'subagents', count: n })
   if (n > 0 || isTurnActive) {
     await syncMusic($, lastDone, lastTotal)
   } else {
@@ -347,6 +381,7 @@ async function addXp($: any, gained: number): Promise<void> {
   if (after > before) {
     await playEffect($, 'sounds/lvup.wav')
     $.ui.toast(`🎉 ニャンコが Lv.${after} にレベルアップ！`)
+    await tsunTask($, { kind: 'levelUp', level: after })
   }
 }
 
@@ -421,6 +456,97 @@ async function startBattle($: any): Promise<void> {
   battleTimers.push($.clock.after(endAt + BATTLE_OUTRO_MS, () => void patchBattle($, id, null)))
 }
 
+// 送ったプロンプトを帯に降らせる。スラッシュコマンドは降らせない
+async function startRain($: any, text: string): Promise<void> {
+  const clean = text.replace(/\s+/g, ' ').trim()
+  if (clean === '' || clean.startsWith('/')) return
+  rainTimer?.cancel()
+  seq += 1
+  const id = seq
+  await update($, rain, () => ({ text: clean, id }))
+  rainTimer = $.clock.after(RAIN_MS, () => {
+    void update($, rain, (cur: { id: number } | null) => (cur !== null && cur.id === id ? null : cur))
+  })
+}
+
+// 🐾 で撫でる: ゴロゴロ音とハート。回数は残す
+async function pet($: any): Promise<void> {
+  petTimer?.cancel()
+  await update($, isPetting, () => true)
+  const n = (await update($, pets, (c: number) => c + 1)) as number
+  await $.store.set('pets', n).catch(() => undefined)
+  await playEffect($, 'sounds/purr.wav')
+  if (n % 10 === 0) $.ui.toast(`ニャンコが ${n} 回なでられてごきげんです ♡`)
+  petTimer = $.clock.after(PET_MS, () => void update($, isPetting, () => false))
+}
+
+// localhost で待ち受けているサーバーを数え直す（起動フォルダも調べる）
+async function refreshServers($: any): Promise<ServerRow[]> {
+  const listen = await $.process.run(['/usr/sbin/lsof', '-nP', '-iTCP', '-sTCP:LISTEN'], { timeoutMs: 8000 }).catch(() => null)
+  if (listen === null || (listen.exitCode !== 0 && listen.stdout === '')) return await read($, servers)
+  const rows = parseListen(listen.stdout)
+  const pids = [...new Set(rows.filter(r => r.isDev).map(r => r.pid))]
+  if (pids.length > 0) {
+    const cwd = await $.process.run(['/usr/sbin/lsof', '-a', '-d', 'cwd', '-p', pids.join(','), '-Fpn'], { timeoutMs: 8000 }).catch(() => null)
+    const map = cwd !== null ? parseCwd(cwd.stdout) : new Map<number, string>()
+    const home = String((await $.process.run(['/usr/bin/printenv', 'HOME']).catch(() => ({ stdout: '' }))).stdout).trim()
+    for (const r of rows) {
+      const dir = map.get(r.pid)
+      if (dir !== undefined) r.cwd = shortPath(dir, home)
+    }
+  }
+  await update($, servers, () => rows)
+  return rows
+}
+
+// 止める: 1 回目で確認に切り替え、2 回目で止める。一覧に出ているプロセスだけを止める
+async function stopServer($: any, row: ServerRow): Promise<void> {
+  if ((await read($, stopArmed)) !== row.port) {
+    await update($, stopArmed, () => row.port)
+    return
+  }
+  await update($, stopArmed, () => null)
+  const listed = (await read($, servers)).some((r: ServerRow) => r.pid === row.pid && r.port === row.port)
+  if (!listed) return
+  const killed = await $.process.run(['/bin/kill', '-TERM', String(row.pid)]).catch((err: unknown) => ({ exitCode: 1, stderr: String(err) }))
+  $.ui.toast(killed.exitCode === 0 ? `:${row.port}（${row.command}）を止めました` : `:${row.port} を止められませんでした`)
+  $.clock.after(800, () => void refreshServers($).catch(() => undefined))
+}
+
+async function isTsundere($: any): Promise<boolean> {
+  return (await read($, character)) === 'tsundere'
+}
+
+// レイにひとこと言わせる
+async function say($: any, s: { expression: Expression; line: string }): Promise<void> {
+  seq += 1
+  const at = await $.clock.now()
+  await update($, tsunLine, () => ({ expression: s.expression, line: s.line, at, id: seq }))
+}
+
+// パラメータを動かして保存する。好感度 100 に初めて届いたら攻略完了のイベント
+async function nudge($: any, delta: { affection: number; trust: number; mood: number }): Promise<void> {
+  const { next, isNewlyCleared } = apply(await read($, tsun), delta)
+  await update($, tsun, () => next)
+  await $.store.set('tsun', next).catch(() => undefined)
+  if (isNewlyCleared) {
+    await say($, { expression: 'blush', line: ENDING_LINE })
+    await playEffect($, 'sounds/fanfare.wav')
+    $.ui.toast(`🎉 ${NAME} を攻略しました！ 好感度 100`)
+  }
+}
+
+async function tsunTask($: any, ev: TaskEvent): Promise<void> {
+  if (!(await isTsundere($))) return
+  await say($, taskLine(ev, stageOf(await read($, tsun))))
+}
+
+async function setCharacter($: any, next: 'nyanko' | 'tsundere'): Promise<void> {
+  await update($, character, () => next)
+  await $.store.set('character', next).catch(() => undefined)
+  if (next === 'tsundere') await tsunTask($, { kind: 'idle' })
+}
+
 async function toggleMute($: any): Promise<void> {
   const muted = (await update($, isMuted, (m: boolean) => !m)) as boolean
   await $.store.set('muted', muted).catch(() => undefined)
@@ -452,6 +578,12 @@ async function pollLedger($: any): Promise<void> {
   const { ledger } = await readLedger($)
   const items = ledger?.items ?? []
   const done = countDone(items)
+  // ツンデレモード: 作業中の項目が変わったら「次は〜ね」
+  const running = items.find(i => i.status === 'running')
+  if (running !== undefined && running.id !== lastRunningId) {
+    lastRunningId = running.id
+    if (isBaselined && done <= seenDone) await tsunTask($, { kind: 'itemStart', note: running.note ?? running.id })
+  }
   if (!isBaselined) {
     seenDone = done
     isBaselined = true
@@ -463,6 +595,9 @@ async function pollLedger($: any): Promise<void> {
   isCelebrated = true
   const now = (await update($, streak, (n: number) => n + gained)) as number
   await playEffect($, comboAsset(now))
+  const finishedItem = items.filter(i => i.status === 'done').slice(-1)[0]
+  await tsunTask($, { kind: 'itemDone', note: finishedItem?.note ?? finishedItem?.id ?? '', done, total: items.length })
+  if (await isTsundere($)) await nudge($, { affection: gained, trust: gained, mood: 2 })
   const finished = items.filter(i => i.status === 'done').slice(-gained).map(i => i.id).join(', ')
   seq += 1
   await show($, {
@@ -493,6 +628,17 @@ export const register: Register = (on, options) => {
     await update($, xpAtom, () => savedXp)
     await update($, wins, () => savedWins)
     await update($, isMuted, () => savedMuted)
+    const savedPets = Number(await $.store.get('pets').catch(() => 0)) || 0
+    await update($, pets, () => savedPets)
+    const savedChar = await $.store.get('character').catch(() => undefined)
+    await update($, character, () => (savedChar === 'tsundere' || savedChar === 'nyanko' ? savedChar : config.character))
+    const savedTsun = (await $.store.get('tsun').catch(() => undefined)) as TsunParams | undefined
+    if (savedTsun && typeof savedTsun.affection === 'number') await update($, tsun, () => ({ ...INITIAL, ...savedTsun }))
+    await $.command.register({ name: 'tsundere', description: 'ツンデレモード（/tsundere on・off・gift・reset、/tsundere でパラメータ）' })
+    await $.command.register({ name: 'localhost', description: 'localhost で動いている開発サーバーを一覧し、開く・止める（ペインで表示）' })
+    void refreshServers($).catch(() => undefined)
+    serverPoll?.cancel()
+    serverPoll = $.clock.every(SERVER_POLL_MS, () => void refreshServers($).catch(() => undefined))
     return next(e)
   })
 
@@ -509,6 +655,81 @@ export const register: Register = (on, options) => {
     }
     const playing = await read($, nowPlaying)
     return { text: `作業BGM: ${(await read($, isMusicOn)) ? 'オン' : 'オフ'} ・ ${playing ?? '停止中'} ・ 連続 ${await read($, streak)}` }
+  })
+
+  on('command.run', { command: 'localhost' }, async ($, e) => {
+    const rows = await refreshServers($)
+    await $.ui.open({ id: PANE, title: 'localhost' })
+    const dev = rows.filter(r => r.isDev)
+    const list = dev.map(r => `:${r.port} ${r.command}${r.cwd ? ` (${r.cwd})` : ''}`).join(' ・ ')
+    return { text: dev.length > 0 ? `開発サーバー ${dev.length} 件: ${list}` : '開発サーバーは動いていません。' }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button, Link } = $.ui.resolve(e) as any
+    const all = await read($, servers)
+    const showAll = await read($, isShowingAllServers)
+    const armed = await read($, stopArmed)
+    const rows = showAll ? all : all.filter((r: ServerRow) => r.isDev)
+    const hidden = all.length - all.filter((r: ServerRow) => r.isDev).length
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Box flexDirection="row" gap={1}>
+          <Text bold>🌐 localhost {rows.length} 件</Text>
+          <Button key="refresh" label="更新" onPress={() => refreshServers($)} />
+          <Button key="toggle-all" label={showAll ? '開発サーバーだけ' : `全部見る（+${hidden}）`} onPress={() => update($, isShowingAllServers, (b: boolean) => !b)} />
+        </Box>
+        {rows.length === 0 ? <Text dimColor>動いている開発サーバーはありません。</Text> : null}
+        {rows.map((r: ServerRow) => (
+          <Box key={`row-${r.port}`} flexDirection="row" gap={1}>
+            <Text color={r.isDev ? 'success' : 'inactive'}>:{r.port}</Text>
+            <Text>{r.command}</Text>
+            <Text dimColor wrap="truncate-end">{r.cwd ?? r.host}</Text>
+            <Link key={`open-${r.port}`} href={urlOf(r)} label="開く" />
+            <Button key={`stop-${r.port}`} label={armed === r.port ? 'もう一度押すと止めます' : '止める'} onPress={() => stopServer($, r)} />
+          </Box>
+        ))}
+      </Box>
+    )
+  })
+
+  on('command.run', { command: 'tsundere' }, async ($, e) => {
+    const arg = e.args.trim()
+    if (arg === 'on') {
+      await setCharacter($, 'tsundere')
+      return { text: `${NAME}が来ました。…べ、別にあんたに呼ばれたから来たわけじゃないから。` }
+    }
+    if (arg === 'off') {
+      await setCharacter($, 'nyanko')
+      return { text: 'ニャンコに戻しました。' }
+    }
+    if (arg === 'reset') {
+      await update($, tsun, () => INITIAL)
+      await $.store.set('tsun', INITIAL).catch(() => undefined)
+      return { text: `${NAME}のパラメータを最初に戻しました。` }
+    }
+    if (arg === 'gift') {
+      const now = await $.clock.now()
+      const last = Number(await $.store.get('giftAt').catch(() => 0)) || 0
+      const isAgain = now - last < GIFT_GAP_MS
+      const g = giftLine(stageOf(await read($, tsun)), isAgain)
+      if (!isAgain) await $.store.set('giftAt', now).catch(() => undefined)
+      await say($, g)
+      if (g.affection > 0) await nudge($, { affection: g.affection, trust: 0, mood: 6 })
+      return { text: `☕ ${g.line}` }
+    }
+    const p = await read($, tsun)
+    return { text: `${NAME}（${STAGE_LABEL[stageOf(p)]}）・好感度 ${p.affection} ・ 信頼 ${p.trust} ・ 機嫌 ${p.mood}${(await isTsundere($)) ? '' : ' ・ /tsundere on で呼べます'}` }
+  })
+
+  // ツンデレモード: ツールを使うたびに、それっぽくひとこと（数秒に 1 回まで）
+  on('tool.call', async ($, e, next) => {
+    if (e.agentId === undefined && (await isTsundere($))) {
+      const cur = await read($, tsunLine)
+      const now = await $.clock.now()
+      if (cur === null || now - cur.at > TOOL_LINE_GAP_MS) await say($, toolLine(e.tool, stageOf(await read($, tsun))))
+    }
+    return next(e)
   })
 
   on('command.run', { command: 'nyanko' }, async ($, e) => {
@@ -539,6 +760,8 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     poll?.cancel()
     isTurnActive = true
+    lastRunningId = null
+    await update($, tsun, (p: TsunParams) => cool(p))
     const { ledger } = await readLedger($)
     const items = ledger?.items ?? []
     seenDone = countDone(items)
@@ -557,6 +780,16 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     cancelTimers()
     await update($, card, () => null)
+    // 送ったプロンプトの文字を帯に降らせる
+    await startRain($, String(e.text ?? '')).catch(() => undefined)
+    // ツンデレモード: プロンプトの言葉づかいで、パラメータとひとことが決まる
+    const text = String(e.text ?? '')
+    if (!text.trim().startsWith('/') && (await isTsundere($))) {
+      const hour = new Date(await $.clock.now()).getHours()
+      const r = readPrompt(text, hour)
+      await say($, r)
+      await nudge($, r)
+    }
     return next(e)
   })
 
@@ -599,6 +832,21 @@ export const register: Register = (on, options) => {
     await show($, withStreak, decision.isAudible)
     await beat($, 'turn.complete', { kind: decision.card.kind, title: decision.card.title, detail: decision.card.detail })
     if (decision.card.kind === 'done') $.ui.toast(`🎉 ${decision.card.title}: ${decision.card.detail}`)
+    // ツンデレモード: 依頼の終わり・人の操作待ち・ふつうのターンの終わりで、ひとこと
+    if (await isTsundere($)) {
+      if (kind === 'done') {
+        const { ledger } = await readLedger($)
+        await tsunTask($, { kind: 'allDone', summary: ledger?.request_summary ?? '' })
+        await nudge($, { affection: 3, trust: 2, mood: 5 })
+      } else if (kind === 'blocked') {
+        const { ledger } = await readLedger($)
+        const b = (ledger?.items ?? []).find(i => i.status === 'blocked')
+        await tsunTask($, { kind: 'blocked', note: b?.note ?? b?.id ?? '' })
+      } else if (kind === 'turn') {
+        const cur = await read($, tsunLine)
+        if (cur === null || (await $.clock.now()) - cur.at > FRESH_MS) await tsunTask($, { kind: 'turnEnd', seconds: Math.round(e.durationMs / 1000) })
+      }
+    }
     // たまに近所の野良猫が出てくる
     turnsSinceBattle += 1
     if (config.battles && shouldEncounter(Math.random(), turnsSinceBattle)) {
@@ -606,6 +854,105 @@ export const register: Register = (on, options) => {
       timers.push($.clock.after(2500, () => void startBattle($).catch(() => undefined)))
     }
     return result
+  })
+
+  // ---- 画面のあちこちを猫仕立てにする（設定 catTheme で切れる） ----
+  // 考え中: ターミナルは猫のしぐさに、デスクトップは「何をしているか」に肉球を添える
+  on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
+    if (!config.catTheme) return next(e)
+    if (await isTsundere($)) {
+      const stage = stageOf(await read($, tsun))
+      const word = e.surface === 'desktop' ? `💢 ${e.props.word}` : tsunSpinner(e.props.mode, stage)
+      return next({ ...e, props: { ...e.props, word } })
+    }
+    const word = e.surface === 'desktop' ? desktopSpinnerWord(e.props.word) : spinnerWord(e.props.mode, seq)
+    return next({ ...e, props: { ...e.props, word, suffix: e.surface === 'desktop' ? e.props.suffix : ' 🐾' } })
+  })
+
+  // ターンの終わりの行（ターミナル）
+  on('ui.render', { component: 'TurnDuration' }, async ($, e, next) => {
+    if (!config.catTheme) return next(e)
+    const { Text } = $.ui.resolve(e)
+    if (await isTsundere($)) return <Text dimColor>{tsunTurnLine(e.props.durationMs, stageOf(await read($, tsun)))}</Text>
+    return <Text dimColor>{turnLine(e.props.durationMs, 0)}</Text>
+  })
+
+  // 入力欄の下のヒント: ターミナルは末尾に足し、デスクトップは案内のあとに続ける
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    if (!config.catTheme) return next(e)
+    const tail = (await isTsundere($))
+      ? tsunHint(e.props.isWorking, e.props.isDraft, stageOf(await read($, tsun)))
+      : hintTail(e.props.isWorking, e.props.isDraft, levelOf(await read($, xpAtom)).level)
+    if (e.surface === 'terminal') return next({ ...e, props: { ...e.props, tail } })
+    return next({ ...e, props: { ...e.props, hint: e.props.hint === '' ? tail : `${e.props.hint} ・ ${tail}` } })
+  })
+
+  // 入力欄の右下のモード表示にニャンコのレベルを足す
+  on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
+    if (!config.catTheme) return next(e)
+    const level = levelOf(await read($, xpAtom)).level
+    const label = (await isTsundere($)) ? `💗 レイ ${(await read($, tsun)).affection}` : `🐈 Lv.${level}`
+    return next({ ...e, props: { ...e.props, modes: [...e.props.modes, label] } })
+  })
+
+  // 確認ダイアログ: 質問の頭に猫を添える
+  on('ui.render', { component: 'AskUserQuestion' }, async ($, e, next) => {
+    if (!config.catTheme) return next(e)
+    return next({ ...e, props: { ...e.props, questions: catQuestions(e.props.questions) } })
+  })
+
+  // 自分で打ったプロンプトの行に肉球を添える（ほかの人やタスクの通知はそのまま）
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    if (!config.catTheme || e.props.origin.kind !== 'composer' || e.props.isExpanded) return next(e)
+    return next({ ...e, props: { ...e.props, text: e.props.text.startsWith('🐾') ? e.props.text : `🐾 ${e.props.text}` } })
+  })
+
+  // お知らせの行（ターミナル）と、裏に回すヒント（ターミナル）
+  on('ui.render', { component: 'InfoNotice' }, async ($, e, next) => {
+    if (!config.catTheme) return next(e)
+    return next({ ...e, props: { ...e.props, text: catNotice(e.props.text) } })
+  })
+  on('ui.render', { component: 'ToolProgress' }, async ($, e, next) => {
+    if (!config.catTheme || e.props.kind !== 'background_hint') return next(e)
+    return next({ ...e, props: { ...e.props, hint: catBackgroundHint(e.props.hint) } })
+  })
+
+  // ツールの行（ターミナル）: 種類ごとの猫の顔を頭に付け、もとの行はそのまま描く
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    if (!config.catTheme || e.surface !== 'terminal') return next(e)
+    const row = await next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="row">
+        <Text>{toolFace(e.props.tool)} </Text>
+        {row}
+      </Box>
+    )
+  })
+  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
+    if (!config.catTheme || e.surface !== 'terminal' || e.props.isExpanded) return next(e)
+    const row = await next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="row">
+        <Text>🐱📚 </Text>
+        {row}
+      </Box>
+    )
+  })
+
+  // このプラグインのコマンドの出力は、ニャンコの吹き出しにする
+  on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
+    if (!config.catTheme || !['nyanko', 'bgm', 'localhost'].includes(e.props.command) || e.props.isErrored) return next(e)
+    const { Box, Text, Markdown } = $.ui.resolve(e) as any
+    return (
+      <Box flexDirection="row" gap={1}>
+        <Text>🐈</Text>
+        <Box flexDirection="column" borderStyle="round" borderColor="warning" paddingX={1}>
+          <Markdown text={e.props.text} />
+        </Box>
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -631,7 +978,26 @@ export const register: Register = (on, options) => {
       const t = $.ui.resolve(e)
       const width = Math.max(420, Math.min(760, e.props.bodyColumns * 8))
       const pose = poseFor(cur, isWorking)
-      const source = fight !== null
+      const isTsun = await isTsundere($)
+      const tl = (await read($, tsunLine)) ?? { expression: 'normal' as const, line: taskLine({ kind: 'idle' }, stageOf(await read($, tsun))).line, at: 0, id: 0 }
+      const tp = await read($, tsun)
+      const now = await $.clock.now()
+      const source = isTsun && fight === null
+        ? novelSvg({
+            width,
+            portrait: await spriteOf($, `rei-${tl.expression}`),
+            name: NAME,
+            stageLabel: `${STAGE_LABEL[stageOf(tp)]} ・ Lv.${info.level}`,
+            line: tl.line,
+            isFresh: now - tl.at < FRESH_MS,
+            affection: tp.affection,
+            trust: tp.trust,
+            mood: tp.mood,
+            playing,
+            isMuted: muted,
+            id: tl.id,
+          })
+        : fight !== null
         ? battleSvg({
             width,
             cat: await spriteOf($, fight.catPose),
@@ -668,13 +1034,18 @@ export const register: Register = (on, options) => {
             streak: await read($, streak),
             isMuted: muted,
             id: cur?.id ?? 0,
+            rain: await read($, rain),
+            isPetting: await read($, isPetting),
+            servers: (await read($, servers)).filter((r: ServerRow) => r.isDev).length,
           })
-      const alt = fight !== null ? `${fight.text} ・ ニャンコ Lv.${info.level}` : `${title} ${detail} ・ ニャンコ Lv.${info.level}${playing !== null ? ` ・ ♪ ${playing}` : ''}`
+      const alt = isTsun && fight === null ? `${NAME}「${tl.line}」 好感度 ${tp.affection}` : fight !== null ? `${fight.text} ・ ニャンコ Lv.${info.level}` : `${title} ${detail} ・ ニャンコ Lv.${info.level}${playing !== null ? ` ・ ♪ ${playing}` : ''}`
       return (
         <t.Box flexDirection="row" alignItems="center" gap={1}>
           <t.Svg source={source} alt={alt} width={width} height={HEIGHT} isInteractive />
           <t.Box flexDirection="column" gap={1}>
             <t.Button key="mute" label={muted ? '🔇' : '🔊'} onPress={() => toggleMute($)} />
+            <t.Button key="pet" label="🐾" onPress={() => pet($)} />
+            <t.Button key="localhost" label="🌐" onPress={() => $.ui.open({ id: PANE, title: 'localhost' })} />
             {cur !== null ? <t.Button key="close" label="✕" onPress={close} /> : null}
           </t.Box>
         </t.Box>
@@ -690,9 +1061,21 @@ export const register: Register = (on, options) => {
           <Text color="warning">Lv.{info.level} {gauge} </Text>
           {playing !== null && !muted ? <Text color="claude">♪ {playing}  </Text> : null}
           <Button key="mute" label={muted ? '🔇' : '🔊'} onPress={() => toggleMute($)} />
+          <Button key="pet" label="🐾" onPress={() => pet($)} />
         </Box>
       </Box>
     )
+    if (await isTsundere($)) {
+      const tl = await read($, tsunLine)
+      const tp = await read($, tsun)
+      return (
+        <Box flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
+          <Text bold color="claude">【{NAME}】<Text dimColor>{STAGE_LABEL[stageOf(tp)]} ・ 好感度 {tp.affection} ・ 信頼 {tp.trust}</Text></Text>
+          <Text wrap="wrap">{tl?.line ?? taskLine({ kind: 'idle' }, stageOf(tp)).line}</Text>
+          {status}
+        </Box>
+      )
+    }
     if (cur === null) return status
     // 消える直前は色を落として薄く見せる
     const accent = isFading ? { dimColor: true } : { color: COLOR[cur.kind], bold: true }

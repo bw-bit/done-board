@@ -1,7 +1,11 @@
 import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { levelOf, pickEnemy, simulateBattle, xpFromUsage, xpToReach } from './game'
-import { stripSvg } from './cat-svg'
+import { rainGlyphs, stripSvg } from './cat-svg'
+import { parseCwd, parseListen, shortPath } from './localhost'
+import { catBackgroundHint, catQuestions, spinnerWord, toolFace, turnLine } from './theme'
+import { INITIAL, apply, readPrompt, stageOf, taskLine, toolLine } from './tsundere'
+import { wrapLine } from './novel-svg'
 
 // 依頼台帳を差し替えて、ターン終了時に看板がどう描かれるかを確かめる
 type Item = { id: string; status: string; note?: string }
@@ -9,10 +13,18 @@ type Ledger = { status: string; request_summary?: string; items: Item[] } | null
 
 let agents: { status: string }[] = []
 let toasts: string[] = []
+let ran: string[] = []
+const LSOF = `COMMAND     PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+rapportd    692    R   11u  IPv4 0x1      0t0  TCP *:65101 (LISTEN)
+node       3669    R   20u  IPv4 0x2      0t0  TCP 127.0.0.1:4327 (LISTEN)
+ControlCe   879    R    9u  IPv4 0x3      0t0  TCP *:7000 (LISTEN)
+Python     1134    R    5u  IPv4 0x4      0t0  TCP 127.0.0.1:8791 (LISTEN)
+Python     1134    R    6u  IPv6 0x5      0t0  TCP [::1]:8791 (LISTEN)`
 
 function stub(on: On, ledgerOf: Ledger | (() => Ledger | string), sounds: string[] = [], ledgerPath = '/w/work/autonomy/completion-sid.json', asked: string[] = [], store: Record<string, unknown> = {}) {
   agents = []
   toasts = []
+  ran = []
   const get = () => (typeof ledgerOf === 'function' ? ledgerOf() : ledgerOf)
   on('session.id', () => ({ value: 'sid' }))
   on('session.cwd', () => ({ value: '/w' }))
@@ -35,6 +47,15 @@ function stub(on: On, ledgerOf: Ledger | (() => Ledger | string), sounds: string
     return { value: undefined }
   })
   on('agent.list', () => ({ value: agents }) as any)
+  on('ui.open', () => ({ value: { isPlaced: true } }) as any)
+  on('process.run', ($, e: any) => {
+    const argv = e.argv as string[]
+    ran.push(argv.join(' '))
+    if (argv[0] === '/usr/sbin/lsof' && argv.includes('-iTCP')) return { value: { exitCode: 0, stdout: LSOF, stderr: '' } }
+    if (argv[0] === '/usr/sbin/lsof') return { value: { exitCode: 0, stdout: 'p3669\nn/Users/me/claudecode/apps/shop\n', stderr: '' } }
+    if (argv[0] === '/usr/bin/printenv') return { value: { exitCode: 0, stdout: '/Users/me\n', stderr: '' } }
+    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+  })
   on('store.get', ($, e: any) => ({ value: store[e.key] }))
   on('store.set', ($, e: any) => {
     store[e.key] = e.value
@@ -46,9 +67,11 @@ function stub(on: On, ledgerOf: Ledger | (() => Ledger | string), sounds: string
   on('command.register', () => ({ value: undefined }) as any)
   on('prompt.submit', ($, e) => ({ text: e.text }) as any)
   // 看板が何も出さないときにエンジンが描くもの（空の帯）
-  on('ui.render', ($, e) => {
-    const { Box } = $.ui.resolve(e)
-    return <Box />
+  on('ui.render', ($, e: any) => {
+    const { Box, Text } = $.ui.resolve(e) as any
+    if (e.component === 'AbovePrompt' || e.component === 'Pane') return <Box />
+    // ほかの場所は、エンジンが受け取った中身を文字にして返す（書き換えを確かめるため）
+    return <Text>{`ENGINE:${JSON.stringify(e.props)}`}</Text>
   })
 }
 
@@ -60,6 +83,7 @@ function flatten(el: any): string {
   const p = el.props ?? {}
   if (el.type === 'Button') return `[${p.label}]`
   if (el.type === 'Svg') return `<svg: ${p.alt}>`
+  if (el.type === 'Markdown') return String(p.text ?? '')
   return flatten(el.children ?? p.children)
 }
 
@@ -520,6 +544,14 @@ test('hint: 作業フォルダが途中で移っても、最初に伝えたパ�
     return { value: undefined }
   })
   on('agent.list', () => ({ value: agents }) as any)
+  on('process.run', ($, e: any) => {
+    const argv = e.argv as string[]
+    ran.push(argv.join(' '))
+    if (argv[0] === '/usr/sbin/lsof' && argv.includes('-iTCP')) return { value: { exitCode: 0, stdout: LSOF, stderr: '' } }
+    if (argv[0] === '/usr/sbin/lsof') return { value: { exitCode: 0, stdout: 'p3669\nn/Users/me/claudecode/apps/shop\n', stderr: '' } }
+    if (argv[0] === '/usr/bin/printenv') return { value: { exitCode: 0, stdout: '/Users/me\n', stderr: '' } }
+    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+  })
   on('store.get', ($, e: any) => ({ value: store[e.key] }))
   on('store.set', ($, e: any) => {
     store[e.key] = e.value
@@ -530,9 +562,11 @@ test('hint: 作業フォルダが途中で移っても、最初に伝えたパ�
   on('command.register', () => ({ value: undefined }) as any)
   on('prompt.submit', ($, e) => ({ text: e.text }) as any)
   on('prompt.compose', () => ({ sections: [] }))
-  on('ui.render', ($, e) => {
-    const { Box } = $.ui.resolve(e)
-    return <Box />
+  on('ui.render', ($, e: any) => {
+    const { Box, Text } = $.ui.resolve(e) as any
+    if (e.component === 'AbovePrompt' || e.component === 'Pane') return <Box />
+    // ほかの場所は、エンジンが受け取った中身を文字にして返す（書き換えを確かめるため）
+    return <Text>{`ENGINE:${JSON.stringify(e.props)}`}</Text>
   })
 
   await $.session.start({} as any).catch(() => undefined)
@@ -684,4 +718,280 @@ test('config: battles を切ると野良猫は出ない（何ターン続いて�
     await clock.advance(3000)
   }
   expect(sounds).not.toContain('sounds/encounter.wav')
+})
+
+// ---- 降ってくるプロンプト・撫でる・localhost ----
+test('rain: 送ったプロンプトの文字が帯に降り、しばらくすると消える', async ($, on) => {
+  const clock = mock.clock(on)
+  stub(on, null)
+  await $.prompt.submit({ text: 'ニャンコ、集計を手伝って' }).catch(() => undefined)
+  const { source } = await svgOf($, 'rain')
+  expect((source.match(/data-rain="/g) ?? []).length).toBe([...'ニャンコ、集計を手伝って'].length)
+  await clock.advance(7000)
+  const after = await svgOf($, 'rain-after')
+  expect(after.source).not.toMatch(/data-rain=/)
+})
+
+test('rain: スラッシュコマンドは降らせない', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  await $.prompt.submit({ text: '/nyanko battle' }).catch(() => undefined)
+  expect((await svgOf($, 'rain-slash')).source).not.toMatch(/data-rain=/)
+})
+
+test('rain: 40 文字までにそろえ、空白はまとめる', () => {
+  const s = rainGlyphs('a  b\n' + 'x'.repeat(100), 1, 0, 400, 100)
+  expect((s.match(/data-rain="/g) ?? []).length).toBe(40)
+})
+
+test('pet: 猫にホバーするとハートと「ゴロゴロ」が出る（CSS の :hover）', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  const { source } = await svgOf($, 'pet-hover')
+  expect(source).toMatch(/\.pet:hover \.hearts/)
+  expect(source).toMatch(/class="pet"/)
+  expect(source).toMatch(/ゴロゴロ/)
+})
+
+test('pet: 🐾 で撫でるとゴロゴロ音が鳴り、回数が残り、しばらくで元に戻る', async ($, on) => {
+  const clock = mock.clock(on)
+  const sounds: string[] = []
+  const store: Record<string, unknown> = {}
+  stub(on, null, sounds, undefined, [], store)
+  const ui = await $.ui.mount({ plugin: 'done-board', surface: 'desktop', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100 } })
+  await ui.press({ key: 'pet' })
+  expect(sounds).toContain('sounds/purr.wav')
+  expect(store.pets).toBe(1)
+  expect(String((await ui.find({ type: 'Svg' }) as any)?.props?.source)).toMatch(/data-pet="on"/)
+  await clock.advance(3000)
+  expect(String((await ui.find({ type: 'Svg' }) as any)?.props?.source)).toMatch(/data-pet="hover"/)
+})
+
+test('localhost: lsof の出力から開発サーバーだけを拾う（常駐アプリと一時ポートは除く）', () => {
+  const rows = parseListen(LSOF)
+  expect(rows.map(r => r.port)).toEqual([4327, 7000, 8791, 65101])
+  expect(rows.filter(r => r.isDev).map(r => `${r.command}:${r.port}`)).toEqual(['node:4327', 'Python:8791'])
+  expect(parseCwd('p12\nn/a/b\n').get(12)).toBe('/a/b')
+  expect(shortPath('/Users/me/a/b/c/d', '/Users/me')).toBe('…/c/d')
+})
+
+test('localhost: 帯に数が出て、ペインで一覧・開く・2 回押しで止める', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true } as any).catch(() => undefined)
+  const r = await $.command.run({ command: 'localhost', args: '', origin: 'user' } as any)
+  expect(r.text).toMatch(/開発サーバー 2 件/)
+  expect((await svgOf($, 'servers')).source).toMatch(/localhost 2/)
+  const pane = await $.ui.mount({ plugin: 'done-board', surface: 'desktop', component: 'Pane', props: { title: 'localhost', isFocused: true, bodyColumns: 80, placement: 'dock' } as any, requestId: 'done-board-localhost' } as any)
+  console.log(`RENDER pane     | ${flatten(await pane.drawn())}`)
+  expect(flatten(await pane.drawn())).toMatch(/:4327/)
+  expect(flatten(await pane.drawn())).toMatch(/apps\/shop|claudecode\/apps/)
+  await pane.press({ key: 'stop-4327' })
+  expect(flatten(await pane.drawn())).toMatch(/もう一度押すと止めます/)
+  expect(ran.some(x => x.startsWith('/bin/kill'))).toBe(false)
+  await pane.press({ key: 'stop-4327' })
+  expect(ran).toContain('/bin/kill -TERM 3669')
+})
+
+// ---- 画面のあちこちを猫仕立てに ----
+async function drawn($: any, component: string, props: any, surface: 'terminal' | 'desktop' = 'terminal') {
+  const ui = await $.ui.mount({ plugin: 'done-board', surface, component, props } as any)
+  return flatten(await ui.drawn())
+}
+
+test('theme: 考え中はターミナルで猫のしぐさ、デスクトップは作業内容に肉球を添える', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  const term = await drawn($, 'Spinner', { word: 'Sauteing', message: null, suffix: '…', mode: 'thinking' })
+  expect(term).toMatch(/考え中/)
+  expect(term).toMatch(/🐾/)
+  const desk = await drawn($, 'Spinner', { word: 'Creating notes.md', message: null, suffix: '…', mode: 'tool-use' }, 'desktop')
+  expect(desk).toMatch(/🐾 Creating notes\.md/)
+})
+
+test('theme: ターンの終わりの行は肉球スタンプ', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  expect(await drawn($, 'TurnDuration', { word: 'Baked', durationMs: 64000 })).toBe('🐾 1分4秒はたらいたニャ')
+})
+
+test('theme: ヒントはもとの案内を残して猫のひとことを足す', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  const term = await drawn($, 'PromptHint', { isDraft: false, isWorking: true, hint: 'esc to interrupt' })
+  expect(term).toMatch(/"hint":"esc to interrupt"/)
+  expect(term).toMatch(/"tail":"🐈 がんばってるニャ/)
+  const desk = await drawn($, 'PromptHint', { isDraft: true, isWorking: false, hint: '? for shortcuts' }, 'desktop')
+  expect(desk).toMatch(/\? for shortcuts ・ 🐾 Enter で送るニャ/)
+})
+
+test('theme: モード表示にニャンコのレベルが並ぶ', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  expect(await drawn($, 'SessionMode', { modes: ['focus'] }, 'desktop')).toMatch(/"modes":\["focus","🐈 Lv\.1"\]/)
+})
+
+test('theme: 確認ダイアログの質問に猫が付く（形式は変えない）', () => {
+  const q = catQuestions([{ question: 'どれにする？', header: 'h', options: [], multiSelect: false }, 'x'])
+  expect(q[0]).toEqual({ question: '🐈 どれにする？', header: 'h', options: [], multiSelect: false })
+  expect(q[1]).toBe('x')
+  expect(catQuestions(q)).toEqual(q)
+})
+
+test('theme: 自分のプロンプトだけ肉球、ほかの通知はそのまま', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  const mine = await drawn($, 'UserMessage', { text: 'hello', origin: { kind: 'composer' }, isExpanded: false }, 'desktop')
+  expect(mine).toMatch(/"text":"🐾 hello"/)
+  const task = await drawn($, 'UserMessage', { text: 'done', origin: { kind: 'task-notification' }, isExpanded: false }, 'desktop')
+  expect(task).toMatch(/"text":"done"/)
+})
+
+test('theme: ツールの行（ターミナル）は種類ごとの猫の顔の後にもとの行を描く', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  const row = await drawn($, 'ToolUse', { tool_use_id: 't', tool: 'Read', input: {}, isRunning: false, isErrored: false, isInterrupted: false })
+  expect(row).toMatch(/^🐱👓 ENGINE:/)
+  const desk = await drawn($, 'ToolUse', { tool_use_id: 't', tool: 'Read', input: {}, isRunning: false, isErrored: false, isInterrupted: false }, 'desktop')
+  expect(desk).toMatch(/^ENGINE:/)
+  expect(toolFace('mcp__x__y')).toBe('🐱🔌')
+})
+
+test('theme: このプラグインのコマンドの出力は吹き出し、ほかのコマンドはそのまま', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  const mine = await drawn($, 'CommandOutput', { command: 'nyanko', args: '', text: 'ニャンコ Lv.2', isErrored: false }, 'desktop')
+  expect(mine).toMatch(/^🐈ニャンコ Lv\.2/)
+  const other = await drawn($, 'CommandOutput', { command: 'cost', args: '', text: '$1', isErrored: false }, 'desktop')
+  expect(other).toMatch(/^ENGINE:/)
+})
+
+test('theme: catTheme を切ると、どこも書き換えない', { options: { catTheme: false } }, async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  expect(await drawn($, 'TurnDuration', { word: 'Baked', durationMs: 3000 })).toMatch(/^ENGINE:/)
+  expect(await drawn($, 'Spinner', { word: 'Sauteing', message: null, suffix: '…', mode: 'thinking' })).toMatch(/Sauteing/)
+})
+
+test('theme: 言い回しの部品', () => {
+  expect(spinnerWord('tool-use', 4)).toMatch(/作業中|追いかけ中/)
+  expect(turnLine(3000, 5)).toBe('🐾 3秒はたらいたニャ ・ +5 EXP')
+  expect(catBackgroundHint('(ctrl+b to run in background)')).toBe('(ctrl+b to run in background ニャ)')
+})
+
+// ---- ツンデレモード（霧島レイ） ----
+test('tsun: プロンプトの言葉づかいでパラメータとひとことが変わる', () => {
+  expect(readPrompt('ありがとう、助かった', 14)).toMatchObject({ affection: 3, expression: 'blush' })
+  expect(readPrompt('早くしろよ', 14)).toMatchObject({ mood: -12, expression: 'angry' })
+  expect(readPrompt('レイさんかわいい', 14)).toMatchObject({ affection: 5, expression: 'blush' })
+  expect(readPrompt('ログの整理をして', 2)).toMatchObject({ expression: 'worried' })
+  expect(readPrompt('a'.repeat(130), 14)).toMatchObject({ trust: 2, expression: 'smug' })
+  expect(readPrompt('直して', 14)).toMatchObject({ expression: 'angry' })
+  expect(readPrompt('テストを追加してください', 14).line).toMatch(/やってあげる/)
+})
+
+test('tsun: 好感度で段階が変わり、100 で攻略完了（一度だけ）', () => {
+  expect(stageOf({ ...INITIAL, affection: 10 })).toBe('tsun')
+  expect(stageOf({ ...INITIAL, affection: 30 })).toBe('warm')
+  expect(stageOf({ ...INITIAL, affection: 60 })).toBe('dere')
+  expect(stageOf({ ...INITIAL, affection: 90 })).toBe('deredere')
+  const a = apply({ ...INITIAL, affection: 98 }, { affection: 5, trust: 0, mood: 0 })
+  expect(a.next.affection).toBe(100)
+  expect(a.isNewlyCleared).toBe(true)
+  expect(stageOf(a.next)).toBe('lover')
+  expect(apply(a.next, { affection: 1, trust: 0, mood: 0 }).isNewlyCleared).toBe(false)
+  expect(apply({ ...INITIAL, affection: 1 }, { affection: -5, trust: 0, mood: -80 }).next).toMatchObject({ affection: 0, mood: -50 })
+})
+
+test('tsun: タスクをツンデレの口調で言う（ツン期とデレ期で言い方が変わる）', () => {
+  expect(toolLine('Read', 'tsun').line).toMatch(/自分で読みなさい/)
+  expect(toolLine('Read', 'dere').line).toMatch(/丁寧に読んであげる/)
+  expect(taskLine({ kind: 'itemStart', note: '集計' }, 'tsun').line).toMatch(/次は「集計」ね/)
+  expect(taskLine({ kind: 'itemDone', note: '集計', done: 1, total: 3 }, 'tsun').line).toMatch(/褒めてもいいのよ/)
+  expect(taskLine({ kind: 'allDone', summary: '売上レポート' }, 'deredere')).toMatchObject({ expression: 'happy' })
+  expect(taskLine({ kind: 'blocked', note: '2FA' }, 'tsun').line).toMatch(/あんたの番/)
+})
+
+test('tsun: セリフは最大 3 行で折り返し、あふれたら … で切る', () => {
+  expect(wrapLine('あいうえお', 4)).toEqual(['あい', 'うえ', 'お'])
+  const long = wrapLine('あ'.repeat(40), 10)
+  expect(long.length).toBe(3)
+  expect(long[2]!.endsWith('…')).toBe(true)
+})
+
+test('tsun: /tsundere on で帯がノベルゲーム風になり、プロンプトに反応して好感度が上がる', async ($, on) => {
+  const clock = mock.clock(on)
+  const store: Record<string, unknown> = {}
+  stub(on, null, [], undefined, [], store)
+  const r = await $.command.run({ command: 'tsundere', args: 'on', origin: 'user' } as any)
+  expect(r.text).toMatch(/べ、別に/)
+  expect(store.character).toBe('tsundere')
+  await clock.advance(1000)
+  await $.prompt.submit({ text: 'ありがとう、いつも助かってる' }).catch(() => undefined)
+  const { svg, source } = await svgOf($, 'tsun')
+  expect(source).toMatch(/霧島レイ/)
+  expect(source).toMatch(/お礼なんていらない/)
+  expect(source).toMatch(/好感度 ♥/)
+  expect(source).toMatch(/<animate attributeName="width"/)
+  expect(String(svg.props.alt)).toMatch(/好感度 13/)
+  expect((store.tsun as any).affection).toBe(13)
+})
+
+test('tsun: ツールを使うとそれっぽくひとこと（数秒に 1 回まで）、考え中もツンデレ口調', async ($, on) => {
+  const clock = mock.clock(on)
+  stub(on, null)
+  // テストの土台側のツール実行（プラグインのフックはその上で動く）
+  on('tool.call', () => ({ result: { ok: true } }) as any)
+  await $.command.run({ command: 'tsundere', args: 'on', origin: 'user' } as any)
+  await clock.advance(5000)
+  await $.tool.call({ tool: 'Grep', pattern: 'x' } as any).catch(() => undefined)
+  expect((await svgOf($, 'tsun-tool')).source).toMatch(/探してあげるわ/)
+  const sp = await drawn($, 'Spinner', { word: 'Sauteing', message: null, suffix: '…', mode: 'thinking' })
+  expect(sp).toMatch(/べ、別に考えてないし/)
+})
+
+test('tsun: 項目が終わると「〜終わらせてあげたわ」と言い、好感度と信頼が上がる', async ($, on) => {
+  const clock = mock.clock(on)
+  const store: Record<string, unknown> = {}
+  let ledger: Ledger = { status: 'running', items: [{ id: 'a', status: 'running', note: '集計' }, { id: 'b', status: 'pending', note: 'グラフ' }, { id: 'c', status: 'pending', note: 'まとめ' }] }
+  stub(on, () => ledger, [], undefined, [], store)
+  await $.command.run({ command: 'tsundere', args: 'on', origin: 'user' } as any)
+  await $.turn.start({ text: 'work', turnId: 't1' })
+  ledger = { status: 'running', items: [{ id: 'a', status: 'done', note: '集計' }, { id: 'b', status: 'running', note: 'グラフ' }, { id: 'c', status: 'pending', note: 'まとめ' }] }
+  await clock.advance(4000)
+  const { source } = await svgOf($, 'tsun-done')
+  expect(source).toMatch(/「集計」、終わらせてあげたわ/)
+  expect((store.tsun as any)).toMatchObject({ affection: 11, trust: 1 })
+})
+
+test('tsun: 好感度 100 で攻略完了のイベント（ファンファーレとトースト）', async ($, on) => {
+  mock.clock(on)
+  const sounds: string[] = []
+  const store: Record<string, unknown> = { tsun: { affection: 97, trust: 50, mood: 0, isCleared: false } }
+  stub(on, null, sounds, undefined, [], store)
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true } as any).catch(() => undefined)
+  await $.command.run({ command: 'tsundere', args: 'on', origin: 'user' } as any)
+  await $.prompt.submit({ text: 'ありがとう' }).catch(() => undefined)
+  expect(toasts.join(' ')).toMatch(/攻略しました/)
+  expect(sounds).toContain('sounds/fanfare.wav')
+  const end = (await svgOf($, 'tsun-end')).source
+  expect(end).toMatch(/今まで素直になれなかった/)
+  expect(end).toMatch(/仕事するの、好き/)
+  expect(end).toMatch(/攻略済み ♥/)
+})
+
+test('tsun: /tsundere off でニャンコに戻る', async ($, on) => {
+  mock.clock(on)
+  stub(on, null)
+  await $.command.run({ command: 'tsundere', args: 'on', origin: 'user' } as any)
+  await $.command.run({ command: 'tsundere', args: 'off', origin: 'user' } as any)
+  const { source } = await svgOf($, 'tsun-off')
+  expect(source).not.toMatch(/霧島レイ/)
+  expect(source).toMatch(/ひと休み中/)
+})
+
+test('tsun: 行頭禁則（句読点や閉じかっこを行の頭に置かない）', () => {
+  const rows = wrapLine('あいう。えお', 6)
+  expect(rows[0]).toBe('あいう。')
+  expect(rows.every(r => !/^[、。」！？]/.test(r))).toBe(true)
 })

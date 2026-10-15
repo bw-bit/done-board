@@ -54,6 +54,12 @@ export type StripView = {
   streak: number
   isMuted: boolean
   id: number
+  // 送ったプロンプトの文字（しばらくの間、上から降ってくる）
+  rain?: { text: string; id: number } | null
+  // 🐾 ボタンで撫でた直後（ホバーしていなくてもハートを出す）
+  isPetting?: boolean
+  // localhost で動いている開発サーバーの数
+  servers?: number
 }
 
 export type BattleView = {
@@ -126,6 +132,48 @@ ${streakBadge}
 ${music}`
 }
 
+// 送ったプロンプトの文字を、トラックの上に雨のように降らせる（最大 40 文字）
+const RAIN_COLORS = ['#fde68a', '#a5f3fc', '#f9a8d4', '#c4b5fd', '#bbf7d0']
+const RAIN_MAX = 40
+
+export function rainGlyphs(text: string, id: number, x0: number, width: number, ground: number): string {
+  const chars = [...text.replace(/\s+/g, ' ').trim()].slice(0, RAIN_MAX)
+  if (chars.length === 0) return ''
+  const step = width / Math.max(chars.length, 8)
+  return chars
+    .map((ch, i) => {
+      // 文字ごとに位置・速さ・色を少しずつずらす（id を混ぜて毎回違う降り方に）
+      const wobble = ((i * 37 + id * 11) % 17) - 8
+      const x = x0 + i * step + wobble * 0.6
+      const dur = 1.6 + ((i * 13 + id) % 7) * 0.12
+      const begin = (i * 0.07).toFixed(2)
+      const land = ground - 6 - ((i * 7) % 5) * 3
+      const color = RAIN_COLORS[(i + id) % RAIN_COLORS.length]
+      return `<text data-rain="${i}" x="${x.toFixed(1)}" y="-12" font-size="13" font-weight="700" fill="${color}" opacity="0">${escapeXml(ch)}<animate attributeName="y" values="-12;${land}" dur="${dur.toFixed(2)}s" begin="${begin}s" calcMode="spline" keySplines="0.4 0 0.9 0.6" keyTimes="0;1" fill="freeze"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.75;1" dur="${(dur + 2.2).toFixed(2)}s" begin="${begin}s" fill="freeze"/></text>`
+    })
+    .join('')
+}
+
+// 撫でる: ホバー（または 🐾 ボタン直後）で、体がふにっと縮み、ハートと「ゴロゴロ…」が出る
+const PET_STYLE = `<style>
+.pet .hearts,.pet .purr{opacity:0;transition:opacity .2s}
+.pet:hover .hearts,.pet:hover .purr,.pet.petting .hearts,.pet.petting .purr{opacity:1}
+.pet:hover .body,.pet.petting .body{animation:squish .5s ease-in-out infinite;transform-box:fill-box;transform-origin:50% 100%}
+.pet .hearts text{animation:float 1.4s ease-out infinite;transform-box:fill-box}
+.pet .hearts text:nth-child(2){animation-delay:.45s}
+.pet .hearts text:nth-child(3){animation-delay:.9s}
+@keyframes squish{0%,100%{transform:scale(1,1)}50%{transform:scale(1.07,.9)}}
+@keyframes float{0%{transform:translateY(4px);opacity:0}30%{opacity:1}100%{transform:translateY(-16px);opacity:0}}
+</style>`
+
+function petCat(inner: string, x: number, w: number, ground: number, isPetting: boolean): string {
+  const top = ground - CAT_H - 6
+  return `<g class="pet${isPetting ? ' petting' : ''}" data-pet="${isPetting ? 'on' : 'hover'}"><rect x="${(x - 6).toFixed(1)}" y="${top}" width="${(w + 12).toFixed(1)}" height="${CAT_H + 10}" fill="transparent" pointer-events="all"/>
+<g class="body">${inner}</g>
+<g class="hearts"><text x="${(x + w * 0.2).toFixed(1)}" y="${top + 8}" font-size="13" fill="#fb7185">♥</text><text x="${(x + w * 0.55).toFixed(1)}" y="${top + 2}" font-size="11" fill="#f9a8d4">♥</text><text x="${(x + w * 0.85).toFixed(1)}" y="${top + 10}" font-size="12" fill="#fb7185">♥</text></g>
+<text class="purr" x="${(x + w + 8).toFixed(1)}" y="${ground - CAT_H / 2}" font-size="11.5" font-weight="700" fill="#fda4af">ゴロゴロ…♡</text></g>`
+}
+
 export function stripSvg(v: StripView): string {
   const [c1, c2] = ACCENT[v.accent]
   const gid = `nk-${v.accent}-${v.id}`
@@ -144,7 +192,7 @@ export function stripSvg(v: StripView): string {
       return `<circle data-step="${escapeXml(st)}" cx="${mx.toFixed(1)}" cy="${ground + 7}" r="3.5" fill="${fill}">${pulse}</circle>`
     }).join('')
     : ''
-  const zz = v.pose === 'sleep'
+  const zz = v.pose === 'sleep' && v.isPetting !== true
     ? `<text x="${(catX + cw - 6).toFixed(1)}" y="${ground - CAT_H + 18}" font-size="13" font-weight="800" fill="#93c5fd">z<animate attributeName="opacity" values="0;1;0" dur="2.4s" repeatCount="indefinite"/></text><text x="${(catX + cw + 4).toFixed(1)}" y="${ground - CAT_H + 8}" font-size="16" font-weight="800" fill="#93c5fd">Z<animate attributeName="opacity" values="0;1;0" dur="2.4s" begin="0.8s" repeatCount="indefinite"/></text>`
     : ''
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${v.width}" height="${HEIGHT}" viewBox="0 0 ${v.width} ${HEIGHT}" font-family="-apple-system, 'Hiragino Sans', 'Noto Sans JP', sans-serif">
@@ -154,9 +202,12 @@ ${frame(v.width, gid, c1, c2)}
 <rect x="${trackX}" y="${ground}" width="${trackW}" height="3" rx="1.5" fill="#334155"/>
 <rect data-progress="${ratio.toFixed(3)}" x="${trackX}" y="${ground}" width="${(trackW * ratio).toFixed(1)}" height="3" rx="1.5" fill="url(#${gid})"/>
 ${v.ratio !== null ? `<text x="${trackX + trackW - 6}" y="${ground - 4}" font-size="14">🏁</text>` : ''}
+${(v.servers ?? 0) > 0 ? `<text data-servers="${v.servers}" x="${trackX + trackW}" y="25" text-anchor="end" font-size="11.5" fill="#7dd3fc">🌐 localhost ${v.servers}</text>` : ''}
 ${milestones}
-${spriteAt(v.cat, catX, ground + 1, CAT_H, v.pose)}
+${PET_STYLE}
+${petCat(spriteAt(v.cat, catX, ground + 1, CAT_H, v.isPetting ? 'joy' : v.pose), catX, cw, ground, v.isPetting === true)}
 ${zz}
+${v.rain ? rainGlyphs(v.rain.text, v.rain.id, trackX + 4, trackW - 8, ground) : ''}
 ${sidePanel(v.width, v)}
 </svg>`
 }
